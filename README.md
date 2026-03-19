@@ -35,13 +35,12 @@ The ring implements the flush protocol from the LLAMA paper without global locks
 2. **Seize** space in the active buffer via atomic fetch-and-add
 3. **Check** atomically whether reservation succeeded; if the buffer is full, seal and rotate
 4. **Write** payload into reserved range while flush-in-progress bit prevents premature dispatch
-5. **On failure** write a "Failed Flush" sentinel to maintain consistency
 
 ## Usage
 
 ### Basic Setup with Automatic Flushing
 
-For most applications, automatic flushing is enabled by default:
+For most applications, automatic flushing should probaly enabled by default:
 
 ```rust
 use std::sync::Arc;
@@ -109,12 +108,12 @@ let ring = FlushRingOptions::new()
 
 ### Configuration Details
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `buffers()` | `usize` | 4 | Number of buffers in the ring |
-| `auto_flush()` | `bool` | true | Automatically flush when buffer sealed |
-| `flusher()` | `Arc<QuickIO>` | None | I/O dispatcher (test mode if None) |
-| **Buffer Size** | — | 1 MB | **Always `ONE_MEGABYTE_BLOCK`** (fixed) |
+| Option          | Type           | Default | Description                             |
+| --------------- | -------------- | ------- | --------------------------------------- |
+| `buffers()`     | `usize`        | 4       | Number of buffers in the ring           |
+| `auto_flush()`  | `bool`         | true    | Automatically flush when buffer sealed  |
+| `flusher()`     | `Arc<QuickIO>` | None    | I/O dispatcher (test mode if None)      |
+| **Buffer Size** | —              | 1 MB    | **Always `ONE_MEGABYTE_BLOCK`** (fixed) |
 
 > **Note**: Buffer size is intentionally fixed at 1 MB for `O_DIRECT` compatibility and efficient page-aligned I/O. All buffers in the ring use this size.
 
@@ -132,6 +131,7 @@ Choose **automatic flushing** (`auto_flush(true)`, the default) when:
 - You want simplicity and predictable, automatic I/O dispatch
 - Standard log-structured storage semantics are sufficient
 - Thread safety and lock-free concurrency are your priorities
+
 
 ## ⚠️ Critical Warnings: Manual Flushing Pitfalls
 
@@ -194,7 +194,7 @@ Without careful synchronization, concurrent threads can corrupt buffer state:
 ```rust
 // DANGEROUS: Unsynchronized concurrent access
 let buffer = ring.current_buffer();
-buffer.decrement_writers();    // Thread A
+buffer.increment_writers();    // Thread A
 let _ = buffer.set_sealed_bit_true();  // Thread B
 ring.flush(buffer);            // Both threads unsynchronized!
 ```
@@ -224,6 +224,8 @@ on_io_completion(buffer);
 ring.reset_buffer(buffer);  // ✓ Re-enable for ring
 ```
 
+
+
 ### 5. **no Flusher Registered (Automatic Resets)**
 
 When `auto_flush` is false and no `QuickIO` is registered, buffers reset immediately (test mode):
@@ -248,6 +250,25 @@ let ring = FlushRingOptions::new()
     .build();
 ```
 
+
+### 6. **no new current Buffer set after seel**
+
+When a caller seals a buffer, they must ensure that a new current buffer is set. They can do so manually through there own protocols or
+throught the built in `rotate_after_seal()` method. The `rotate_after_seal()` method which rotates the ring away from the from its current state to the next available buffer.
+
+
+``` rust
+    let buffer = ring.current_buffer();
+    let _ = buffer.set_sealed_bit_true(); 
+
+    self.rotate_after_seal(buffer.pos)?; // Rotates to the next available buffer
+    
+    ring.flush(buffer);           
+
+```
+
+
+
 ## Detailed Reference: Manual Flushing APIs
 
 ### Methods for Manual Control
@@ -267,12 +288,12 @@ let offset = state_offset(state);  // Parse packed state
 - Ring may rotate anytime if the current buffer is sealed
 - Safe for read-only inspection only
 
-#### `current_buffer_full() -> bool`
+#### `is_current_buffer_sealed() -> bool`
 
 Check if current buffer is sealed (full):
 
 ```rust
-if ring.current_buffer_full() {
+if ring.is_current_buffer_sealed() {
     ring.flush_current_buffer();
 }
 ```
@@ -356,19 +377,27 @@ for entry in entries {
             Err(_) => {
                 // Buffer full, must flush
                 let _ = current.set_sealed_bit_true();
+                ring.rotate_after_seal(current.pos); // Must rotate
+                
+
                 ring.flush_current_buffer();
-                // Ring will rotate; retry on new buffer
             }
         }
     }
 }
+
+
+
 ```
+ If need be we can keep track of an address range slot for every buffer For the purpose of log Structured Systems, this is needed as buffers should never write to the same location twice. The `next_address_range` attribute may be atomically
+ incremented to sort of logically move the the BufferRing along the log.
 
 ## Implementation Checklist for Manual Flushing
 
 When implementing manual flushing, verify:
 
 - [ ] Every sealed buffer is eventually flushed
+- [ ] Current buffer has been set
 - [ ] `reset_buffer()` is called only after I/O completion
 - [ ] No buffer is preemptively reset before I/O starts
 - [ ] `QuickIO` is registered (not None)
@@ -418,7 +447,6 @@ The ring is fully thread-safe:
 ## Performance Characteristics
 
 - **Write latency**: Sub-microsecond atomic operations (no locks)
-- **Throughput**: Scales with number of concurrent writers and cores
 - **Memory overhead**: Fixed ~64 bytes per buffer for metadata
 - **I/O batching**: Amortizes overhead by buffering multiple writes per flush
 
@@ -476,7 +504,7 @@ let mut flush_count = 0;
 
 // ... write operations ...
 
-if ring.current_buffer_full() {
+if ring.is_current_buffer_sealed() {
     ring.flush_current_buffer();
     flush_count += 1;
     
