@@ -1,6 +1,6 @@
 # Buffer Ring
 
-A high-performance, latch-free I/O buffer ring implementation for concurrent log-structured storage. Built on io_uring for efficient asynchronous I/O operations on Linux systems. Intended to be the sole write path for Bloom_Db
+A latch-free I/O buffer ring implementation for concurrent log-structured storage. Built on io_uring for efficient asynchronous I/O operations on Linux systems. Intended to be the sole write path for Bloom_Db
 
 ## Overview
 
@@ -45,9 +45,9 @@ For most applications, automatic flushing is enabled by default:
 
 ```rust
 use std::sync::Arc;
-use flush_buffer_ring::{FlushBufferRing, FlushRingOptions, FlushBehavior};
+use flush_buffer_ring::{BufferRing, FlushRingOptions, QuickIO};
 
-let flusher = Arc::new(FlushBehavior::new_parallel());
+let flusher = Arc::new(QuickIO::with_no_wait_appender(io_uring, file));
 
 // Create a ring with 4 buffers, 1 MB each, auto-flushing enabled
 let ring = FlushRingOptions::new()
@@ -62,9 +62,9 @@ If you need to implement custom buffer protocols or have specific flushing requi
 
 ```rust
 use std::sync::Arc;
-use flush_buffer_ring::{FlushBufferRing, FlushRingOptions, FlushBehavior};
+use flush_buffer_ring::{BufferRing, FlushRingOptions, QuickIO};
 
-let flusher = Arc::new(FlushBehavior::new_parallel());
+let flusher = Arc::new(QuickIO::with_no_wait_appender(io_uring, file));
 
 // Create a ring with MANUAL flushing
 let ring = FlushRingOptions::new()
@@ -113,7 +113,7 @@ let ring = FlushRingOptions::new()
 |--------|------|---------|-------------|
 | `buffers()` | `usize` | 4 | Number of buffers in the ring |
 | `auto_flush()` | `bool` | true | Automatically flush when buffer sealed |
-| `flusher()` | `Arc<FlushBehavior>` | None | I/O dispatcher (test mode if None) |
+| `flusher()` | `Arc<QuickIO>` | None | I/O dispatcher (test mode if None) |
 | **Buffer Size** | — | 1 MB | **Always `ONE_MEGABYTE_BLOCK`** (fixed) |
 
 > **Note**: Buffer size is intentionally fixed at 1 MB for `O_DIRECT` compatibility and efficient page-aligned I/O. All buffers in the ring use this size.
@@ -226,7 +226,7 @@ ring.reset_buffer(buffer);  // ✓ Re-enable for ring
 
 ### 5. **no Flusher Registered (Automatic Resets)**
 
-When `auto_flush` is false and no `flushBehavior` is registered, buffers reset immediately (test mode):
+When `auto_flush` is false and no `QuickIO` is registered, buffers reset immediately (test mode):
 
 ```rust
 let ring = FlushRingOptions::new()
@@ -241,7 +241,7 @@ let ring = FlushRingOptions::new()
 **Fix**: Always register a `flusher` in production:
 
 ```rust
-let flusher = Arc::new(FlushBehavior::with_wait_appender(io_uring, file));
+let flusher = Arc::new(QuickIO::with_wait_appender(io_uring, file));
 let ring = FlushRingOptions::new()
     .auto_flush(false)
     .flusher(flusher)  // ✓ Real dispatcher
@@ -304,7 +304,7 @@ ring.flush(buffer);  // Sets flush-in-progress bit
 
 **Must be paired with:**
 - `reset_buffer()` after I/O completion
-- Monitoring via your `FlushBehavior` dispatcher
+- Monitoring via your `QuickIO` dispatcher
 
 #### `reset_buffer(&buffer: &FlushBuffer)`
 
@@ -322,11 +322,11 @@ fn on_completion(buffer: &FlushBuffer) {
 ### Complete Manual Flushing Protocol
 
 ```rust
-use flush_buffer_ring::{FlushRingOptions, FlushBehavior};
+use flush_buffer_ring::{FlushRingOptions, QuickIO};
 use std::sync::Arc;
 
 // 1. Create ring with manual control
-let flusher = Arc::new(FlushBehavior::with_wait_appender(...));
+let flusher = Arc::new(QuickIO::with_wait_appender(...));
 let ring = Arc::new(
     FlushRingOptions::new()
         .buffers(8)
@@ -371,7 +371,7 @@ When implementing manual flushing, verify:
 - [ ] Every sealed buffer is eventually flushed
 - [ ] `reset_buffer()` is called only after I/O completion
 - [ ] No buffer is preemptively reset before I/O starts
-- [ ] `FlushBehavior` is registered (not None)
+- [ ] `QuickIO` is registered (not None)
 - [ ] Completion callbacks are properly synchronized
 - [ ] Ring exhaustion is monitored and alerts configured
 - [ ] Tests verify your flush schedule cannot deadlock
@@ -379,17 +379,17 @@ When implementing manual flushing, verify:
 
 ## Flush Behaviors
 
-The crate provides built-in flush strategies via `FlushBehavior`:
+The crate provides built-in flush strategies via `QuickIO`:
 
 ```rust
-use flush_buffer_ring::FlushBehavior;
+use flush_buffer_ring::QuickIO;
 use std::sync::Arc;
 
 // Parallel flushing: multiple buffers dispatched concurrently
-let parallel = FlushBehavior::new_parallel();
+let parallel = QuickIO::with_no_wait_appender(io_uring, file);
 
 // Serial flushing: buffers dispatched one at a time
-let serial = FlushBehavior::new_serial();
+let serial = QuickIO::with_wait_appender(io_uring, file);
 ```
 
 ## Error Handling
@@ -429,9 +429,9 @@ The ring is fully thread-safe:
 ```rust
 use std::sync::Arc;
 use std::thread;
-use flush_buffer_ring::{FlushBufferRing, FlushRingOptions, FlushBehavior};
+use flush_buffer_ring::{BufferRing, FlushRingOptions, QuickIO};
 
-let flusher = Arc::new(FlushBehavior::new_parallel());
+let flusher = Arc::new(QuickIO::with_no_wait_appender(io_uring, file));
 let ring = Arc::new(
     FlushRingOptions::new()
         .buffers(4)
