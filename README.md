@@ -527,6 +527,11 @@ if ring.is_current_buffer_sealed() {
 - Ring rotation uses a simple index scanning strategy to find available buffers
 - No memory barriers are used beyond those in atomic operations
 
+
+
+## Notes 
+Work to fully extract the FlushBufferRing implementation from Bloom_lfs is currently underway
+
 ## Testing
 
 Run the comprehensive test suite:
