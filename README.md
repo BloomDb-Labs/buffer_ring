@@ -199,7 +199,7 @@ let _ = buffer.set_sealed_bit_true();  // Thread B
 ring.flush(buffer);            // Both threads unsynchronized!
 ```
 
-**Fix**: Use the `put()` method which handles synchronization internally, or implement your own CAS-based locking.
+**Fix**: Use the `put()` method which handles synchronization internally, or implement your own CAS-based locking. Bare in mind, put also automatically rotates a buffer with insufficent space.
 
 ### 4. **Flushed Buffer Still Locked (Ring Stall)**
 
