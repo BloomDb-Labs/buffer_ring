@@ -3,7 +3,7 @@
 //! This module is intended to suit the needs of all of LLAMA's in-memory write-staging layers.
 //! Its a fixed-size ring of on MB-aligned [`FlushBuffer`]s that amortises individual page-state
 //! writes into larger, sequential I/O operations before they are dispatched to
-//! the [`LogStructuredStore`](crate::log_structured_store::LogStructuredStore).
+//! the LogStructuredStore.
 //!
 //! ## Design Goals
 //!

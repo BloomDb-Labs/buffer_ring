@@ -1,12 +1,12 @@
 //! # QuickIO — `io_uring`-backed Write Dispatchers
 //!
 //! This module defines the two write strategies LLAMA uses to flush sealed
-//! [`FlushBuffer`]s to the log-structured backing file:
+//! [`crate::FlushBuffer`]s to the log-structured backing file:
 //!
 //! | Strategy                       | Type                                 | Ordering |
 //! |--------------------------------|--------------------------------------|----------|
-//! | Tail-Localised Writes          | [`QuickIO::TailLocalized`]    | Parallel |
-//! | Strictly Serialised Writes     | [`QuickIO::Searalized`]      | `IO_LINK`|
+//! | Tail-Localised Writes          | [`QuickIO::TailLocalized`]           | Parallel |
+//! | Strictly Serialised Writes     | [`QuickIO::Searalized`]              | `IO_LINK`|
 //!
 //! Both strategies are backed by the same [`BackingStore`] struct; the difference
 //! lies in the `io_uring` submission-queue flags applied at dispatch time.
@@ -50,7 +50,7 @@
 //! All buffers submitted through this module **must** be aligned to
 //! [`ONE_MEGABYTE_BLOCK`] and their lengths must be a multiple of the device's
 //! logical block size.  This invariant is upheld by `Buffer::new_aligned`
-//! inside [`crate::flush_buffer::BufferRing`].
+//! inside [`crate::BufferRing`].
 
 use io_uring::{opcode, squeue, types, IoUring};
 
@@ -107,7 +107,7 @@ pub type SharedAsyncFileWriter = Arc<parking_lot::Mutex<IoUring>>;
 ///
 /// ```rust,no_run
 /// use std::sync::Arc;
-/// use buffer_ring::WriteMode;
+/// use flush_buffer_ring::flush_behaviour::WriteMode;
 ///
 /// // High-throughput ingestion path — writes may land out of order within
 /// // RING_SIZE × FOUR_KB_PAGE of the tail.
@@ -266,7 +266,7 @@ impl BackingStore {
 ///
 /// ```rust,no_run
 /// use std::sync::Arc;
-/// use buffer_ring::{QuickIO, WriteMode};
+/// use flush_buffer_ring::flush_behaviour::{QuickIO, WriteMode};
 ///
 /// let file    = Arc::new(std::fs::File::open("/dev/null").unwrap());
 /// let io_ring = Arc::new(parking_lot::Mutex::new(io_uring::IoUring::new(8).unwrap()));
