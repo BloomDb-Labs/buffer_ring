@@ -199,7 +199,7 @@ let _ = buffer.set_sealed_bit_true();  // Thread B
 ring.flush(buffer);            // Both threads unsynchronized!
 ```
 
-**Fix**: Use the `put()` method which handles synchronization internally, or implement your own CAS-based locking.
+**Fix**: Use the `put()` method which handles synchronization internally, or implement your own CAS-based locking. Bare in mind, put also automatically rotates a buffer with insufficent space.
 
 ### 4. **Flushed Buffer Still Locked (Ring Stall)**
 
@@ -526,6 +526,11 @@ if ring.is_current_buffer_sealed() {
 - The flush-in-progress bit prevents race conditions during I/O dispatch
 - Ring rotation uses a simple index scanning strategy to find available buffers
 - No memory barriers are used beyond those in atomic operations
+
+
+
+## Notes 
+Work to fully extract the FlushBufferRing implementation from Bloom_lfs is currently underway
 
 ## Testing
 
