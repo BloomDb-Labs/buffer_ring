@@ -1,7 +1,7 @@
 //! # Flush Buffer — Latch-Free I/O Buffer Ring
 //!
-//! This module implements LLAMA's in-memory write-staging layer: a fixed-size
-//! ring of 4 KB-aligned [`FlushBuffer`]s that amortises individual page-state
+//! This module is intended to suit the needs of all of LLAMA's in-memory write-staging layers.
+//! Its a fixed-size ring of on MB-aligned [`FlushBuffer`]s that amortises individual page-state
 //! writes into larger, sequential I/O operations before they are dispatched to
 //! the [`LogStructuredStore`](crate::log_structured_store::LogStructuredStore).
 //!
@@ -10,7 +10,7 @@
 //! | Goal                    | Mechanism                                                  |
 //! |-------------------------|------------------------------------------------------------|
 //! | Latch-free writes       | Single packed [`AtomicUsize`] state word per buffer        |
-//! | `O_DIRECT` compatibility| 4 KB-aligned allocation via [`Buffer::new_aligned`]       |
+//! | `O_DIRECT` compatibility| 4 KB-aligned allocation via [`Buffer::new_aligned`]        |
 //! | Amortised I/O           | Multiple threads fill one buffer before it is flushed      |
 //! | All threads participate | Any thread may seal or initiate a flush                    |
 //!
@@ -27,9 +27,6 @@
 //!    rotates to the next available slot.
 //! 4. **Write** the payload into the reserved range while the flush-in-progress
 //!    bit prevents the buffer from being dispatched to stable storage prematurely.
-//! 5. **On failure** at step 3, write a "Failed Flush" sentinel into the reserved
-//!    space.  This wastes a few bytes but removes all ambiguity about which writes
-//!    succeeded.
 //!
 //! Though the currently implementation delegates the handling of all erroneous and invalid
 //! states to the caller, the current implementation of the Flush proceedure should lend itself
@@ -60,6 +57,9 @@
 
 pub mod flush_behaviour;
 
+// Re-exports for convenient access to the main API
+pub use crate::flush_behaviour::{QuickIO, WriteMode, BackingStore, SharedAsyncFileWriter};
+
 use std::{
     cell::UnsafeCell,
     pin::Pin,
@@ -74,13 +74,11 @@ use io_uring::squeue::Entry;
 
 use std::alloc::{Layout, alloc_zeroed};
 
-use crate::flush_behaviour::QuickIO;
-
 /// A 4 KB-aligned, heap-allocated byte buffer suitable for `O_DIRECT` I/O.
 ///
 /// `Buffer` owns a single contiguous allocation that is aligned to
-/// [`ONE_MEGABYTE_BLOCK`] (4 096 bytes) — the minimum alignment required by
-/// `O_DIRECT` on all common block devices.
+/// [`ONE_MEGABYTE_BLOCK`]. A 4 kilobyte size block is the minimum alignment required by
+/// `O_DIRECT` on all common block devices. All mutiples this minimal allignment are valid 
 ///
 /// Cursor management is **not** handled here.  Instead, [`FlushBuffer`] uses
 /// atomic fetch-and-add on its packed state word to hand out non-overlapping
@@ -137,7 +135,6 @@ unsafe impl Sync for Buffer {}
 /// holds a pointer into the buffer while a write is in flight.
 pub(crate) type SharedBuffer = Arc<Buffer>;
 
-// ── State word constants ──────────────────────────────────────────────────────
 
 /// Bit 0 of the state word — set when the buffer is closed to new writers.
 const SEALED_BIT: usize = 1 << 0;
@@ -241,7 +238,7 @@ pub enum BufferMsg {
     FreeToFlush(Arc<FlushBuffer>),
 }
 
-/// A single 4 KiB-aligned latch-free I/O buffer.
+/// A single  latch-free I/O buffer.
 ///
 /// Multiple threads write into a `FlushBuffer` concurrently by atomically
 /// claiming non-overlapping byte ranges through [`FlushBuffer::reserve_space`].  Once the
@@ -281,7 +278,7 @@ pub struct FlushBuffer {
 
     /// The LSS address slot assigned to this buffer at seal time.
     ///
-    /// On-disk byte offset = `local_lss_address_slot × ONE_MEGABYTE_BLOCK`.
+    /// On-disk byte offset = `local_lss_address_slot × FlushBufferSize`.
     /// Assigned by [`BufferRing::next_address_range`] via fetch-add;
     /// guaranteed unique across all concurrently sealed buffers.
     pub(crate) local_lss_address_slot: AtomicUsize,
@@ -678,13 +675,15 @@ impl BufferRing {
                     return Err(BufferError::EncounteredSealedBuffer);
                 }
 
-                // Claim a unique LSS slot for this buffer before rotating.
+                // Claim a unique slot in stable storage for this buffer before rotating.
                 let slot = self.next_address_range.fetch_add(1, Ordering::AcqRel);
                 current
                     .local_lss_address_slot
                     .store(slot, Ordering::Release);
 
-                self.rotate_after_seal(current.pos)?;
+                if self.auto_flush {
+                    self.rotate_after_seal(current.pos)?;
+                }
 
                 // Race to own the flush.  If writers are still active, the last
                 // one to decrement will also attempt this and one of them will
@@ -825,7 +824,7 @@ impl BufferRing {
     /// let mut flush_count = 0;
     /// for batch in incoming_batches {
     ///     // Write batch into current buffer...
-    ///     if ring.current_buffer_full() {
+    ///     if ring.is_current_buffer_sealed() {
     ///         ring.flush_current_buffer();  // Manually trigger flush
     ///         flush_count += 1;
     ///     }
@@ -857,7 +856,7 @@ impl BufferRing {
     }
 
     /// Check if the current buffer is sealed (full).
-    pub fn current_buffer_full(&self) -> bool {
+    pub fn is_current_buffer_sealed(&self) -> bool {
         state_sealed(self.current_buffer().state.load(Ordering::Acquire))
     }
 
@@ -872,6 +871,9 @@ impl BufferRing {
     pub fn flush_current_buffer(&self) {
         let buffer = self.current_buffer();
         self.flush(buffer);
+
+
+        
     }
 
     /// Reset a buffer's state after it has been flushed to storage.
@@ -996,6 +998,8 @@ impl Default for FlushRingOptions {
         Self::new()
     }
 }
+
+
 
 // =============================================================================
 //  Tests
@@ -1633,14 +1637,14 @@ mod tests {
         );
     }
 
-    /// Test current_buffer_full() detection.
+    /// Test is_current_buffer_sealed() detection.
     #[test]
     fn manual_flush_buffer_full_detection() {
         let ring = FlushRingOptions::new().buffers(2).auto_flush(false).build();
 
         // Initially buffer should not be full
         assert!(
-            !ring.current_buffer_full(),
+            !ring.is_current_buffer_sealed(),
             "buffer should not be full initially"
         );
 
@@ -1650,7 +1654,7 @@ mod tests {
 
         // Now it should be full
         assert!(
-            ring.current_buffer_full(),
+            ring.is_current_buffer_sealed(),
             "sealed buffer should be reported as full"
         );
     }
@@ -1761,7 +1765,7 @@ mod tests {
 
         // All these should be callable
         let _buf = ring.current_buffer();
-        let _is_full = ring.current_buffer_full();
+        let _is_full = ring.is_current_buffer_sealed();
         let buf = ring.current_buffer();
         let _ = buf.set_sealed_bit_true();
         ring.flush_current_buffer();
@@ -1784,6 +1788,6 @@ mod tests {
 
         // The manual methods should still be available
         let _buf = ring.current_buffer();
-        let _is_full = ring.current_buffer_full();
+        let _is_full = ring.is_current_buffer_sealed();
     }
 }

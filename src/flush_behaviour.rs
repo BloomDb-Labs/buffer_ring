@@ -5,8 +5,8 @@
 //!
 //! | Strategy                       | Type                                 | Ordering |
 //! |--------------------------------|--------------------------------------|----------|
-//! | Tail-Localised Writes          | [`QuickIO::NoWaitAppender`]    | Parallel |
-//! | Strictly Serialised Writes     | [`QuickIO::WaitAppender`]      | `IO_LINK`|
+//! | Tail-Localised Writes          | [`QuickIO::TailLocalized`]    | Parallel |
+//! | Strictly Serialised Writes     | [`QuickIO::Searalized`]      | `IO_LINK`|
 //!
 //! Both strategies are backed by the same [`BackingStore`] struct; the difference
 //! lies in the `io_uring` submission-queue flags applied at dispatch time.
@@ -16,20 +16,20 @@
 //! ### Tail-Localised Writes
 //!
 //! Append-only write patterns deliver substantial throughput improvements on
-//! both spinning-disk and SSD storage because they eliminate head seeks and
-//! enable write coalescing by the device firmware.  LLAMA exploits this by
-//! staging writes in a ring of 4 KB-aligned [`FlushBuffer`]s.  Each buffer
+//! both spinning-disk and SSD storage. LLAMA exploits this by
+//! staging writes in a ring of [`ONE_MEGABYTE_BLOCK`] Buffers.  Each buffer
 //! is assigned a unique, non-overlapping slot in the LSS address space at seal
 //! time; once sealed, buffers are flushed independently with no synchronisation
 //! between them.
 //!
 //! Because slots are claimed atomically (fetch-add) but flushed concurrently, a
 //! buffer sealed *later* may land on disk *before* an earlier one.  This means
-//! flushes are **tail-localised** rather than strictly sequential — the maximum
-//! write distance from the logical tail is bounded by:
+//! flushes are **tail-localised** rather than strictly sequential. Assuming that all 
+//! writes are completied within a single rotation , the maximum write distance from the 
+//! logical tail is bounded by:
 //!
 //! ```text
-//! max_distance = RING_SIZE × FOUR_KB_PAGE
+//! max_distance = RING_SIZE × ONE_MEGABYTE_BLOCK
 //! ```
 //!
 //! ### Serialised Writes
@@ -43,14 +43,12 @@
 //!
 //! LLAMA deliberately avoids a dedicated watchdog thread.  Instead, a calling
 //! thread inspects the completion queue at a well-defined point on the write
-//! path via [`BackingStore::cqueue`] or [`LogStructuredStore::check_async_cque`].
-//! Failed writes are re-submitted from the stored SQE; successful writes advance
-//! the `hi_stable` stability pointer.
-//!
+//! path via [`BackingStore::cqueue`]. 
+//! 
 //! ## `O_DIRECT` Alignment Invariant
 //!
 //! All buffers submitted through this module **must** be aligned to
-//! [`FOUR_KB_PAGE`] and their lengths must be a multiple of the device's
+//! [`ONE_MEGABYTE_BLOCK`] and their lengths must be a multiple of the device's
 //! logical block size.  This invariant is upheld by `Buffer::new_aligned`
 //! inside [`crate::flush_buffer::BufferRing`].
 
@@ -63,6 +61,10 @@ use std::{
     sync::Arc,
     cell::UnsafeCell,
 };
+
+
+#[allow(unused_imports)]
+use crate::ONE_MEGABYTE_BLOCK;
 
 /// Type alias for the submit queue entry storage used by flush operations.
 pub type SubmitQueueEntry = UnsafeCell<Option<squeue::Entry>>;
@@ -105,7 +107,7 @@ pub type SharedAsyncFileWriter = Arc<parking_lot::Mutex<IoUring>>;
 ///
 /// ```rust,no_run
 /// use std::sync::Arc;
-/// use flush_buffer_ring::flush_behaviour::WriteMode;
+/// use buffer_ring::WriteMode;
 ///
 /// // High-throughput ingestion path — writes may land out of order within
 /// // RING_SIZE × FOUR_KB_PAGE of the tail.
@@ -134,7 +136,7 @@ pub struct BackingStore {
     /// Shared `O_DIRECT` file handle — the LSS backing file.
     store: Arc<File>,
     /// Shared `io_uring` instance.  Protected by a [`parking_lot::Mutex`] so
-    /// that multiple threads can submit SQEs without data races.
+    /// that multiple threads can submit SQEs.
     flusher: SharedAsyncFileWriter,
     /// Determines SQE flags applied to every write submission.
     mode: WriteMode,
@@ -149,6 +151,8 @@ impl BackingStore {
     /// * `file_handle` — `O_DIRECT` file handle to the LSS backing file.
     /// * `mode`        — Write ordering mode.
     pub fn new(io_uring: SharedAsyncFileWriter, file_handle: Arc<File>, mode: WriteMode) -> Self {
+
+        
         Self {
             flusher: io_uring,
             store: file_handle,
@@ -160,7 +164,7 @@ impl BackingStore {
     ///
     /// Returns immediately after the SQE is pushed to the submission ring; the
     /// kernel picks it up asynchronously.  Poll completions via
-    /// [`BackingStore::cqueue`] or [`LogStructuredStore::check_async_cque`].
+    /// [`BackingStore::cqueue`].
     ///
     /// The SQE is also stored inside `submit_entry` so that a
     /// failed completion can re-submit the exact same write without
@@ -171,8 +175,8 @@ impl BackingStore {
     /// * `buffer_data` — Aligned slice covering exactly the bytes to write
     ///                   (`0..used_bytes`).
     /// * `at`          — Byte offset in the backing file (`slot × FOUR_KB_PAGE`).
-    /// * `user_data`   — Raw pointer to the buffer cast to `u64`, stored as the
-    ///                   SQE's `user_data` so the completion handler can recover
+    /// * `buffer_ptr`   — Raw pointer to the buffer cast to `u64`, stored as the
+    ///                   SQE's `buffer_ptr` so the completion handler can recover
     ///                   the buffer without an extra lookup.
     /// * `submit_entry` — Storage for the submitted SQE for potential re-submission.
     ///
@@ -189,7 +193,7 @@ impl BackingStore {
         &self,
         buffer_data: &[u8],
         at: u64,
-        user_data: u64,
+        buffer_ptr: u64,
         submit_entry: &SubmitQueueEntry,
     ) -> io::Result<()> {
         let flags = match self.mode {
@@ -212,7 +216,7 @@ impl BackingStore {
         .offset(at)
         .build()
         .flags(flags)
-        .user_data(user_data);
+        .user_data(buffer_ptr);
 
         let mut ring = self.flusher.lock();
 
@@ -251,10 +255,10 @@ impl BackingStore {
 ///
 /// # Variants
 ///
-/// * [`WaitAppender`](QuickIO::WaitAppender) — wraps a [`BackingStore`] in
+/// * [`Searalized`](QuickIO::Searalized) — wraps a [`BackingStore`] in
 ///   [`WriteMode::SerializedWrites`].  Use for WAL segments or any workload that
 ///   requires each write to complete before the next begins.
-/// * [`NoWaitAppender`](QuickIO::NoWaitAppender) — wraps a [`BackingStore`]
+/// * [`TailLocalized`](QuickIO::TailLocalized) — wraps a [`BackingStore`]
 ///   in [`WriteMode::TailLocalizedWrites`].  Use for high-throughput data
 ///   ingestion where write ordering within the ring is acceptable.
 ///
@@ -262,33 +266,33 @@ impl BackingStore {
 ///
 /// ```rust,no_run
 /// use std::sync::Arc;
-/// use flush_buffer_ring::flush_behaviour::{QuickIO, WriteMode};
+/// use buffer_ring::{QuickIO, WriteMode};
 ///
 /// let file    = Arc::new(std::fs::File::open("/dev/null").unwrap());
 /// let io_ring = Arc::new(parking_lot::Mutex::new(io_uring::IoUring::new(8).unwrap()));
 ///
-/// let flusher = QuickIO::with_no_wait_appender(io_ring, file);
+/// let flusher = QuickIO::new(io_ring, file);
 /// ```
 pub enum QuickIO {
     /// Strictly serialised write appender (`IO_LINK` per SQE).
-    WaitAppender(BackingStore),
-    /// Parallel tail-localised write appender (no ordering flags).
-    NoWaitAppender(BackingStore),
+    Searalized(BackingStore),
+    /// Tail-localised write appender (no ordering flags).
+    TailLocalized(BackingStore),
 }
 
 impl QuickIO {
-    /// Construct a [`QuickIO::WaitAppender`] from an existing ring and file handle.
+    /// Construct a [`QuickIO::Searalized`] from an existing ring and file handle.
     ///
     /// Writes submitted through this variant will use [`WriteMode::SerializedWrites`].
-    pub fn with_wait_appender(io_uring: SharedAsyncFileWriter, file: Arc<File>) -> Self {
-        QuickIO::WaitAppender(BackingStore::new(io_uring, file, WriteMode::SerializedWrites))
+    pub fn link(io_uring: SharedAsyncFileWriter, file: Arc<File>) -> Self {
+        QuickIO::Searalized(BackingStore::new(io_uring, file, WriteMode::SerializedWrites))
     }
 
-    /// Construct a [`QuickIO::NoWaitAppender`] from an existing ring and file handle.
+    /// Construct a [`QuickIO::TailLocalized`] from an existing ring and file handle.
     ///
     /// Writes submitted through this variant will use [`WriteMode::TailLocalizedWrites`].
-    pub fn with_no_wait_appender(io_uring: SharedAsyncFileWriter, file: Arc<File>) -> Self {
-        QuickIO::NoWaitAppender(BackingStore::new(
+    pub fn new(io_uring: SharedAsyncFileWriter, file: Arc<File>) -> Self {
+        QuickIO::TailLocalized(BackingStore::new(
             io_uring,
             file,
             WriteMode::TailLocalizedWrites,
@@ -308,7 +312,7 @@ impl QuickIO {
     pub fn submit_buffer<B: FlushableBuffer>(&self, buffer: &B) {
         let buffer_data = buffer.buffer_data();
         let at = buffer.offset();
-        let user_data = buffer.user_data();
+        let user_data = buffer.user_data(); // In this case, the user data is always a buffer's pinned location in memmory
         let submit_entry = buffer.submit_entry();
         self.submit_buffer_raw(buffer_data, at, user_data, submit_entry);
     }
@@ -325,7 +329,7 @@ impl QuickIO {
     /// `buffer_data` must remain valid until the CQE is observed.
     pub fn submit_buffer_raw(&self, buffer_data: &[u8], at: u64, user_data: u64, submit_entry: &SubmitQueueEntry) {
         match self {
-            QuickIO::WaitAppender(a) | QuickIO::NoWaitAppender(a) => {
+            QuickIO::Searalized(a) | QuickIO::TailLocalized(a) => {
                 let _ = a.submit(buffer_data, at, user_data, submit_entry);
             }
         }
@@ -369,13 +373,11 @@ impl QuickIO {
 
     /// Acquire exclusive access to the `io_uring` instance's completion queue.
     ///
-    /// Used by [`LogStructuredStore::check_async_cque`] to drain CQEs without
-    /// duplicating the lock acquisition pattern across call sites.
     pub fn get_cqueue(
         &self,
     ) -> parking_lot::lock_api::MutexGuard<'_, parking_lot::RawMutex, IoUring> {
         match self {
-            QuickIO::WaitAppender(appender) | QuickIO::NoWaitAppender(appender) => {
+            QuickIO::Searalized(appender) | QuickIO::TailLocalized(appender) => {
                 appender.cqueue()
             }
         }
@@ -383,7 +385,7 @@ impl QuickIO {
 
     fn get_backing_store(&self) -> &BackingStore {
         match self {
-            QuickIO::WaitAppender(backing_store) | QuickIO::NoWaitAppender(backing_store) => {
+            QuickIO::Searalized(backing_store) | QuickIO::TailLocalized(backing_store) => {
                 backing_store
             }
         }

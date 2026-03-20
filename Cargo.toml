@@ -1,8 +1,11 @@
 [package]
-name = "flush_buffer_ring"
+name = "buffer_ring"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0"
+repository = "https://github.com/BloomDb-Labs/buffer_ring"
+homepage = "https://github.com/BloomDb-Labs/buffer_ring"
+documentation = "https://docs.rs/buffer_ring"
 
 [dependencies]
 io-uring = "0.7.11"

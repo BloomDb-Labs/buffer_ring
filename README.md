@@ -46,7 +46,7 @@ For most applications, automatic flushing should probaly enabled by default:
 use std::sync::Arc;
 use flush_buffer_ring::{BufferRing, FlushRingOptions, QuickIO};
 
-let flusher = Arc::new(QuickIO::with_no_wait_appender(io_uring, file));
+let flusher = Arc::new(QuickIO::new(io_uring, file));
 
 // Create a ring with 4 buffers, 1 MB each, auto-flushing enabled
 let ring = FlushRingOptions::new()
@@ -63,7 +63,7 @@ If you need to implement custom buffer protocols or have specific flushing requi
 use std::sync::Arc;
 use flush_buffer_ring::{BufferRing, FlushRingOptions, QuickIO};
 
-let flusher = Arc::new(QuickIO::with_no_wait_appender(io_uring, file));
+let flusher = Arc::new(QuickIO::new(io_uring, file));
 
 // Create a ring with MANUAL flushing
 let ring = FlushRingOptions::new()
@@ -253,8 +253,8 @@ let ring = FlushRingOptions::new()
 
 ### 6. **no new current Buffer set after seel**
 
-When a caller seals a buffer, they must ensure that a new current buffer is set. They can do so manually through there own protocols or
-throught the built in `rotate_after_seal()` method. The `rotate_after_seal()` method which rotates the ring away from the from its current state to the next available buffer.
+
+When a caller seals a buffer, they must ensure that a new current buffer is set. They can do so manually through there own protocols or throught the built in `rotate_after_seal()` method. The `rotate_after_seal()` method which rotates the ring away from the from its current state to the next available buffer.
 
 
 ``` rust
@@ -415,10 +415,10 @@ use flush_buffer_ring::QuickIO;
 use std::sync::Arc;
 
 // Parallel flushing: multiple buffers dispatched concurrently
-let parallel = QuickIO::with_no_wait_appender(io_uring, file);
+let parallel = QuickIO::new(io_uring, file);
 
 // Serial flushing: buffers dispatched one at a time
-let serial = QuickIO::with_wait_appender(io_uring, file);
+let serial = QuickIO::link(io_uring, file);
 ```
 
 ## Error Handling
@@ -459,7 +459,7 @@ use std::sync::Arc;
 use std::thread;
 use flush_buffer_ring::{BufferRing, FlushRingOptions, QuickIO};
 
-let flusher = Arc::new(QuickIO::with_no_wait_appender(io_uring, file));
+let flusher = Arc::new(QuickIO::new(io_uring, file));
 let ring = Arc::new(
     FlushRingOptions::new()
         .buffers(4)
