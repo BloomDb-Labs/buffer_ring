@@ -54,11 +54,21 @@
 //!   reservations.
 //!
 //! Bits 7..2 represent unused space
+//!
+
+// TODO
+/*
+    Allow for the mutability and access of attributes from using clean apis
+
+*/
 
 pub mod flush_behaviour;
+pub mod flush_buffer_api;
+pub mod state;
 
 // Re-exports for convenient access to the main API
-pub use crate::flush_behaviour::{QuickIO, WriteMode, BackingStore, SharedAsyncFileWriter};
+pub use crate::flush_behaviour::{QuickIO, SharedAsyncFileWriter, WriteMode};
+pub use crate::state::State;
 
 use std::{
     cell::UnsafeCell,
@@ -78,7 +88,7 @@ use std::alloc::{Layout, alloc_zeroed};
 ///
 /// `Buffer` owns a single contiguous allocation that is aligned to
 /// [`ONE_MEGABYTE_BLOCK`]. A 4 kilobyte size block is the minimum alignment required by
-/// `O_DIRECT` on all common block devices. All mutiples this minimal allignment are valid 
+/// `O_DIRECT` on all common block devices. All mutiples this minimal allignment are valid
 ///
 /// Cursor management is **not** handled here.  Instead, [`FlushBuffer`] uses
 /// atomic fetch-and-add on its packed state word to hand out non-overlapping
@@ -135,25 +145,24 @@ unsafe impl Sync for Buffer {}
 /// holds a pointer into the buffer while a write is in flight.
 pub(crate) type SharedBuffer = Arc<Buffer>;
 
-
 /// Bit 0 of the state word — set when the buffer is closed to new writers.
-const SEALED_BIT: usize = 1 << 0;
+pub const SEALED_BIT: usize = 1 << 0;
 
 /// Bit 1 of the state word — set while a flush is in progress.
 ///
 /// Prevents a second flush from being fired concurrently and prevents new
 /// writers from entering a buffer that is already being drained.
-pub(crate) const FLUSH_IN_PROGRESS_BIT: usize = 1 << 1;
+pub const FLUSH_IN_PROGRESS_BIT: usize = 1 << 1;
 
 /// Amount added to the state word to record one additional active writer.
 const WRITER_SHIFT: usize = 8;
 const WRITER_ONE: usize = 1 << WRITER_SHIFT;
 
 /// Mask covering the writer-count field (bits 8..32).
-const WRITER_MASK: usize = 0x00FF_FFFF00;
+pub const WRITER_MASK: usize = 0x00FF_FFFF00;
 
 /// The write-offset field occupies the top 32 bits of the state word.
-const OFFSET_SHIFT: usize = 32;
+pub const OFFSET_SHIFT: usize = 32;
 
 /// Amount added to the state word to advance the write offset by one byte.
 const OFFSET_ONE: usize = 1 << OFFSET_SHIFT;
@@ -166,19 +175,19 @@ pub const ONE_MEGABYTE_BLOCK: usize = 1024 * 1024;
 
 #[inline(always)]
 /// Extracts the current offset out of the state variable
-pub(crate) fn state_offset(state: usize) -> usize {
+pub fn state_offset(state: usize) -> usize {
     state >> OFFSET_SHIFT
 }
 
 #[inline(always)]
 /// Extracts the current current number of writers out of the state variable
-pub(crate) fn state_writers(state: usize) -> usize {
+pub fn state_writers(state: usize) -> usize {
     (state & WRITER_MASK) >> WRITER_SHIFT
 }
 
 #[inline(always)]
 /// Returns the sealed bit of the state variable
-pub(crate) fn state_sealed(state: usize) -> bool {
+pub fn state_sealed(state: usize) -> bool {
     state & SEALED_BIT != 0
 }
 
@@ -268,264 +277,42 @@ pub enum BufferMsg {
 #[derive(Debug)]
 pub struct FlushBuffer {
     /// Packed atomic state — see type-level docs for the bit layout.
-    pub(crate) state: AtomicUsize,
+    state: AtomicUsize,
 
     /// Backing aligned byte store shared with the `io_uring` submission path.
-    pub(crate) buf: SharedBuffer,
+    buf: SharedBuffer,
 
     /// Position of this buffer within the parent [`BufferRing`].
-    pub(crate) pos: usize,
+    pub pos: usize,
 
     /// The LSS address slot assigned to this buffer at seal time.
     ///
-    /// On-disk byte offset = `local_lss_address_slot × FlushBufferSize`.
+    /// On-disk byte offset = `local_address × FlushBufferSize`.
     /// Assigned by [`BufferRing::next_address_range`] via fetch-add;
     /// guaranteed unique across all concurrently sealed buffers.
-    pub(crate) local_lss_address_slot: AtomicUsize,
+    local_address: AtomicUsize, // TODO getters and setters
 
     /// The most recently submitted `io_uring` SQE for this buffer.
     ///
     /// Stored so that a failed CQE can re-fire the exact same write without
     /// re-constructing the SQE.  Guarded by the flush-in-progress state
     /// transition — only one thread may write or read this field at a time.
-    pub(crate) submit_queue_entry: UnsafeCell<Option<Entry>>,
+    submit_queue_entry: UnsafeCell<Option<Entry>>, // TODO getters
 }
 
 unsafe impl Send for FlushBuffer {}
 unsafe impl Sync for FlushBuffer {}
 
-impl FlushBuffer {
-    /// Create a new `FlushBuffer` at ring position `buffer_number` with a
-    /// `size`-byte aligned backing allocation.
-    ///
-    /// The initial LSS address slot is set to `buffer_number` so that buffers
-    /// are pre-assigned non-overlapping slots at construction time.  The ring
-    /// will update this via [`set_new_address_space_range`](Self::set_new_address_space_range)
-    /// each time the buffer is reused.
-    pub fn new_buffer(buffer_number: usize, size: usize) -> FlushBuffer {
-        Self {
-            state: AtomicUsize::new(0),
-            buf: Arc::new(Buffer::new_aligned(size)),
-            pos: buffer_number,
-            local_lss_address_slot: AtomicUsize::new(0),
-            submit_queue_entry: UnsafeCell::new(None),
-        }
-    }
-
-    /// Atomically update this buffer's LSS address slot to `address_space`.
-    ///
-    /// Returns `Ok(previous_slot)` on success or `Err(observed)` if the CAS
-    /// fails (another thread updated the slot concurrently).
-    pub fn set_new_address_space_range(&mut self, address_space: usize) -> Result<usize, usize> {
-        let range = self.local_lss_address_slot.load(Ordering::Relaxed);
-        self.local_lss_address_slot.compare_exchange(
-            range,
-            address_space,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        )
-    }
-
-    /// Return `true` if this buffer is open to new writers.
-    ///
-    /// A buffer is available when neither the sealed bit nor the
-    /// flush-in-progress bit is set.
-    pub fn is_available(&self) -> bool {
-        self.state.load(Ordering::Acquire) & (SEALED_BIT | FLUSH_IN_PROGRESS_BIT) == 0
-    }
-
-    /// Attempt to atomically reserve `payload_size` bytes in this buffer.
-    ///
-    /// On success returns the byte offset at which the caller should write its
-    /// payload.  The caller **must** call [`decrement_writers`](Self::decrement_writers)
-    /// once the write is complete.
-    ///
-    /// # Errors
-    ///
-    /// * [`BufferError::EncounteredSealedBuffer`] — the buffer is sealed or a
-    ///   flush is in progress; the caller should ask the ring to rotate.
-    /// * [`BufferError::InsufficientSpace`] — `payload_size` bytes would exceed
-    ///   [`ONE_MEGABYTE_BLOCK`]; the caller should seal the buffer and retry on the
-    ///   next one.
-    /// * [`BufferError::FailedReservation`] — the CAS failed due to contention;
-    ///   the caller should retry immediately.
-    ///
-    /// # Panics
-    ///
-    /// Panics in debug builds if `payload_size > ONE_MEGABYTE_BLOCK`.
-    pub fn reserve_space(&self, payload_size: usize) -> Result<usize, BufferError> {
-        assert!(
-            payload_size <= ONE_MEGABYTE_BLOCK,
-            "payload larger than buffer"
-        );
-
-        let state = self.state.load(Ordering::Acquire);
-
-        if state & (SEALED_BIT | FLUSH_IN_PROGRESS_BIT) != 0 {
-            return Err(BufferError::EncounteredSealedBuffer);
-        }
-
-        let offset = state_offset(state);
-
-        if offset + payload_size > ONE_MEGABYTE_BLOCK {
-            return Err(BufferError::InsufficientSpace);
-        }
-
-        // Analagous to the increment_writers() method
-        let new = state
-            .wrapping_add(payload_size * OFFSET_ONE)
-            .wrapping_add(WRITER_ONE);
-
-        match self
-            .state
-            .compare_exchange(state, new, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => Ok(offset),
-            Err(_) => Err(BufferError::FailedReservation),
-        }
-    }
-
-    /// Decrement the active-writer count by one.
-    ///
-    /// Should be called by every thread that previously succeeded at
-    /// [`reserve_space`](Self::reserve_space) once it has finished copying its
-    /// payload.  Returns the **previous** state word value.
-    #[inline]
-    pub fn decrement_writers(&self) -> usize {
-        self.state.fetch_sub(WRITER_ONE, Ordering::AcqRel)
-    }
-
-    /// Increment the active-writer count by one.
-    ///
-    /// Returns the **previous** state word value.
-    #[inline]
-    pub fn increment_writers(&self) -> usize {
-        self.state.fetch_add(WRITER_ONE, Ordering::AcqRel)
-    }
-
-    /// Set the flush-in-progress bit.
-    ///
-    /// Returns the **previous** state word value.  The caller should check
-    /// whether the bit was already set in the returned value — only the thread
-    /// that observes the bit transitioning from `0` to `1` owns the flush.
-    #[inline]
-    pub fn set_flush_in_progress(&self) -> usize {
-        self.state.fetch_or(FLUSH_IN_PROGRESS_BIT, Ordering::AcqRel)
-    }
-
-    /// Clear the flush-in-progress bit.
-    ///
-    /// Returns the **previous** state word value.
-    #[inline]
-    pub fn clear_flush_in_progress(&self) -> usize {
-        self.state
-            .fetch_and(!FLUSH_IN_PROGRESS_BIT, Ordering::AcqRel)
-    }
-
-    /// Copy `payload` into the buffer at `offset`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must have obtained `offset` from a successful
-    /// [`reserve_space`](Self::reserve_space) call and must not alias the same
-    /// region from another thread.
-    pub fn write(&self, offset: usize, payload: &[u8]) {
-        debug_assert!(offset + payload.len() <= self.buf.size);
-
-        unsafe {
-            let dst = (*self.buf.buffer.get()).add(offset);
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), dst, payload.len());
-        }
-    }
-
-    /// Set the sealed bit, preventing any further reservations.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BufferError::EncounteredSealedBufferDuringCOMPEX`] if the
-    /// buffer was already sealed before this call.
-    pub fn set_sealed_bit_true(&self) -> Result<(), BufferError> {
-        let prev = self.state.fetch_or(SEALED_BIT, Ordering::AcqRel);
-        if state_sealed(prev) {
-            Err(BufferError::EncounteredSealedBufferDuringCOMPEX)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Clear the sealed bit, re-opening the buffer to new writers.
-    ///
-    /// Only succeeds when there are no active writers and no flush is in
-    /// progress.
-    ///
-    /// # Errors
-    ///
-    /// * [`BufferError::ActiveUsers`] — writers or a flush are still active.
-    /// * [`BufferError::EncounteredUnSealedBufferDuringCOMPEX`] — the buffer
-    ///   was not sealed to begin with.
-    /// * [`BufferError::FailedUnsealed`] — the CAS failed; retry.
-    #[allow(unused)]
-    pub(crate) fn set_sealed_bit_false(&self) -> Result<(), BufferError> {
-        let current = self.state.load(Ordering::Acquire);
-
-        if state_writers(current) != 0 || state_flush_in_progress(current) {
-            return Err(BufferError::ActiveUsers);
-        }
-
-        if !state_sealed(current) {
-            return Err(BufferError::EncounteredUnSealedBufferDuringCOMPEX);
-        }
-
-        match self.state.compare_exchange(
-            current,
-            current & !SEALED_BIT,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(BufferError::FailedUnsealed),
-        }
-    }
-
-    /// Reset the write offset to zero, leaving all flag bits intact.
-    ///
-    /// Intended for use in tests only.  In production code the ring resets
-    /// buffers through [`BufferRing::reset_buffer`].
-    pub fn reset_offset(&self) {
-        loop {
-            let current = self.state.load(Ordering::Acquire);
-            let zeroed = current & 0x0000_0000_FFFF_FFFF;
-            if self
-                .state
-                .compare_exchange(current, zeroed, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
-            }
-        }
-    }
-
-    /// Return a raw snapshot of the packed state word.
-    ///
-    /// Available in test builds only.  Use the `state_offset`, `state_writers`,
-    /// `state_sealed`, and `state_flush_in_progress` helpers to decode the
-    /// individual fields.
-    #[cfg(test)]
-    pub(crate) fn state_snapshot(&self) -> usize {
-        self.state.load(Ordering::Acquire)
-    }
-}
-
 impl crate::flush_behaviour::FlushableBuffer for FlushBuffer {
-    fn buffer_data(&self) -> &[u8] {
+    fn buffer_data(&self, data_len: usize) -> &[u8] {
         unsafe {
             let ptr = *self.buf.buffer.get();
-            &*std::ptr::slice_from_raw_parts(ptr, ONE_MEGABYTE_BLOCK)
+            &*std::ptr::slice_from_raw_parts(ptr, data_len as usize)
         }
     }
 
     fn offset(&self) -> u64 {
-        self.local_lss_address_slot.load(Ordering::Acquire) as u64 * ONE_MEGABYTE_BLOCK as u64
+        self.local_address.load(Ordering::Acquire) as u64
     }
 
     fn user_data(&self) -> u64 {
@@ -561,7 +348,7 @@ pub struct BufferRing {
     /// Updated atomically via CAS during rotation.  The pointed-to buffer is
     /// guaranteed to be valid for the lifetime of the ring because all buffers
     /// are owned by `ring` and the ring is `Pin`ned.
-    pub current_buffer: AtomicPtr<FlushBuffer>,
+    current_buffer: AtomicPtr<FlushBuffer>, // TODO getters and Setters
 
     /// Pinned, heap-allocated array of all buffers.
     ///
@@ -576,8 +363,8 @@ pub struct BufferRing {
     /// Monotonically increasing LSS slot counter.
     ///
     /// Incremented by fetch-add at seal time; the resulting value is stored as
-    /// the sealed buffer's `local_lss_address_slot`.
-    pub next_address_range: AtomicUsize,
+    /// the sealed buffer's `local_address`.
+    next_address_range: AtomicUsize, // TODO getters and Setters dont make pub
 
     _size: usize,
 
@@ -677,13 +464,13 @@ impl BufferRing {
 
                 // Claim a unique slot in stable storage for this buffer before rotating.
                 let slot = self.next_address_range.fetch_add(1, Ordering::AcqRel);
-                current
-                    .local_lss_address_slot
-                    .store(slot, Ordering::Release);
+                current.local_address.store(slot, Ordering::Release);
 
                 if self.auto_flush {
                     self.rotate_after_seal(current.pos)?;
                 }
+
+                let data_len = current.state().offset();
 
                 // Race to own the flush.  If writers are still active, the last
                 // one to decrement will also attempt this and one of them will
@@ -693,7 +480,7 @@ impl BufferRing {
                     if self.auto_flush {
                         match self.store.as_ref() {
                             Some(store) => {
-                                store.submit_buffer(current);
+                                store.submit_buffer(current, data_len);
                             }
                             None => {
                                 // Test mode: no dispatcher — reset immediately.
@@ -714,6 +501,8 @@ impl BufferRing {
             Err(e) => return Err(e),
 
             Ok(offset) => {
+                let data_len = current.state().offset();
+
                 current.write(offset, payload);
 
                 let prev = current.decrement_writers();
@@ -729,7 +518,7 @@ impl BufferRing {
                         // Only flush if auto_flush is enabled
                         if self.auto_flush {
                             let flush_buffer = self.ring.get(current.pos).unwrap().clone();
-                            self.flush(&flush_buffer);
+                            self.flush(&flush_buffer, data_len);
                         }
                         return Ok(BufferMsg::SuccessfullWriteFlush);
                     }
@@ -830,12 +619,12 @@ impl BufferRing {
     ///     }
     /// }
     /// ```
-    pub fn flush(&self, buffer: &FlushBuffer) {
+    pub fn flush(&self, buffer: &FlushBuffer, data_len: usize) {
         buffer.set_flush_in_progress();
 
         match self.store.as_ref() {
             Some(store) => {
-                store.submit_buffer(buffer);
+                store.submit_buffer(buffer, data_len);
             }
             None => {
                 self.reset_buffer(buffer);
@@ -868,12 +657,9 @@ impl BufferRing {
     /// # Panics
     ///
     /// Panics if no buffer is currently active (should not happen in normal usage).
-    pub fn flush_current_buffer(&self) {
+    pub fn flush_current_buffer(&self, data_len: usize) {
         let buffer = self.current_buffer();
-        self.flush(buffer);
-
-
-        
+        self.flush(buffer, data_len);
     }
 
     /// Reset a buffer's state after it has been flushed to storage.
@@ -998,8 +784,6 @@ impl Default for FlushRingOptions {
         Self::new()
     }
 }
-
-
 
 // =============================================================================
 //  Tests
@@ -1569,32 +1353,6 @@ mod tests {
         assert!(!ring.auto_flush, "ring should have auto_flush disabled");
     }
 
-    /// Test that flush_current_buffer() can be called.
-    #[test]
-    fn manual_flush_current_buffer_callable() {
-        let ring = FlushRingOptions::new().buffers(2).auto_flush(false).build();
-
-        let current = ring.current_buffer();
-
-        // Seal this buffer so flush will process it
-        let _ = current.set_sealed_bit_true();
-
-        // This should not panic
-        ring.flush_current_buffer();
-    }
-
-    /// Test that flush() can be called on a specific buffer.
-    #[test]
-    fn manual_flush_specific_buffer_callable() {
-        let ring = FlushRingOptions::new().buffers(3).auto_flush(false).build();
-
-        let buffer = ring.current_buffer();
-        let _ = buffer.set_sealed_bit_true();
-
-        // This should not panic
-        ring.flush(buffer);
-    }
-
     /// Test that reset_buffer() properly clears state bits.
     #[test]
     fn manual_flush_reset_clears_state() {
@@ -1676,7 +1434,7 @@ mod tests {
         let _ = buffer.set_sealed_bit_true();
 
         // Step 3: Manually flush and reset
-        ring.flush(buffer);
+        ring.flush(buffer, payload.len());
         ring.reset_buffer(buffer);
 
         // Verify buffer is clean
@@ -1745,7 +1503,7 @@ mod tests {
                     Err(_) => {
                         // Buffer exhausted, flush it
                         let _ = current.set_sealed_bit_true();
-                        ring_clone.flush_current_buffer();
+                        ring_clone.flush_current_buffer(payload.len());
                         flush_count_clone.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -1756,23 +1514,6 @@ mod tests {
 
         // The test completes without panicking, demonstrating the manual protocol works
         assert!(ring.auto_flush == false);
-    }
-
-    /// Test that all manual API methods are accessible.
-    #[test]
-    fn manual_flush_api_completeness() {
-        let ring = FlushRingOptions::new().buffers(4).auto_flush(false).build();
-
-        // All these should be callable
-        let _buf = ring.current_buffer();
-        let _is_full = ring.is_current_buffer_sealed();
-        let buf = ring.current_buffer();
-        let _ = buf.set_sealed_bit_true();
-        ring.flush_current_buffer();
-        ring.reset_buffer(buf);
-
-        // All methods worked without panicking
-        assert!(true);
     }
 
     /// Test that auto_flush=true maintains original behavior.
@@ -1789,5 +1530,115 @@ mod tests {
         // The manual methods should still be available
         let _buf = ring.current_buffer();
         let _is_full = ring.is_current_buffer_sealed();
+    }
+
+    // =========================================================================
+    // Flush Behaviour (QuickIO) Tests
+    // =========================================================================
+
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    /// Test QuickIO read method with a temporary file.
+    #[test]
+    fn quickio_read_basic() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let test_data = b"Hello, QuickIO read test!";
+        temp_file.write_all(test_data).unwrap();
+        temp_file.flush().unwrap();
+
+        let file = Arc::new(temp_file.as_file().try_clone().unwrap());
+
+        let quickio = QuickIO::new(file);
+
+        let mut buffer = vec![0u8; test_data.len()];
+
+        // Read from offset 0
+        quickio.read(buffer.as_mut_ptr(), buffer.len(), 0).unwrap();
+
+        assert_eq!(&buffer, test_data);
+    }
+
+    /// Test QuickIO read with offset.
+    #[test]
+    fn quickio_read_with_offset() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        temp_file.write_all(test_data).unwrap();
+        temp_file.flush().unwrap();
+
+        let file = Arc::new(temp_file.as_file().try_clone().unwrap());
+
+        let quickio = QuickIO::new(file);
+
+        let mut buffer = vec![0u8; 10];
+
+        // Read 10 bytes starting from offset 5
+        quickio.read(buffer.as_mut_ptr(), 10, 5).unwrap();
+
+        let expected = &test_data[5..15];
+        assert_eq!(&buffer, expected);
+    }
+
+    /// Test QuickIO read with unaligned offset (should still work due to internal alignment).
+    #[test]
+    fn quickio_read_unaligned_offset() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        temp_file.write_all(test_data).unwrap();
+        temp_file.flush().unwrap();
+
+        let file = Arc::new(temp_file.as_file().try_clone().unwrap());
+
+        let quickio = QuickIO::new(file);
+
+        let mut buffer = vec![0u8; 5];
+
+        // Read 5 bytes starting from unaligned offset 7
+        quickio.read(buffer.as_mut_ptr(), 5, 7).unwrap();
+
+        let expected = &test_data[7..12];
+        assert_eq!(&buffer, expected);
+    }
+
+    #[test]
+    fn read_write_test() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let file = Arc::new(temp_file.as_file().try_clone().unwrap());
+
+        let quickio = QuickIO::new(file);
+
+        let expected: Vec<[u8; 4096]> = vec![
+            [0u8; 4096],
+            [1u8; 4096],
+            [2u8; 4096],
+            [3u8; 4096],
+            [4u8; 4096],
+        ];
+
+        let buffers: Vec<FlushBuffer> = (0..expected.len())
+            .map(|i| {
+                let mut buf = FlushBuffer::default();
+                buf.set_address(i * 4096).expect("msg");
+                buf
+            })
+            .collect();
+
+        for (buf, data) in buffers.iter().zip(expected.iter()) {
+            buf.write(0, data);
+            quickio.submit_buffer(buf, 4096);
+        }
+
+        quickio.sync_data().unwrap();
+
+        for (i, check_against) in expected.iter().enumerate() {
+            let mut read_buffer = vec![0u8; 4096];
+            let byte_offset = (i * 4096) as u64;
+            quickio
+                .read(read_buffer.as_mut_ptr(), 4096, byte_offset)
+                .unwrap();
+
+            assert_eq!(&read_buffer[..], check_against, "slot {i} mismatch");
+        }
     }
 }

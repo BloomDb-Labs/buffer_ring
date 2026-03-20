@@ -24,8 +24,8 @@
 //!
 //! Because slots are claimed atomically (fetch-add) but flushed concurrently, a
 //! buffer sealed *later* may land on disk *before* an earlier one.  This means
-//! flushes are **tail-localised** rather than strictly sequential. Assuming that all 
-//! writes are completied within a single rotation , the maximum write distance from the 
+//! flushes are **tail-localised** rather than strictly sequential. Assuming that all
+//! writes are completied within a single rotation , the maximum write distance from the
 //! logical tail is bounded by:
 //!
 //! ```text
@@ -43,8 +43,8 @@
 //!
 //! LLAMA deliberately avoids a dedicated watchdog thread.  Instead, a calling
 //! thread inspects the completion queue at a well-defined point on the write
-//! path via [`BackingStore::cqueue`]. 
-//! 
+//! path via [`BackingStore::cqueue`].
+//!
 //! ## `O_DIRECT` Alignment Invariant
 //!
 //! All buffers submitted through this module **must** be aligned to
@@ -52,19 +52,22 @@
 //! logical block size.  This invariant is upheld by `Buffer::new_aligned`
 //! inside [`crate::BufferRing`].
 
-use io_uring::{opcode, squeue, types, IoUring};
+use io_uring::{IoUring, cqueue::Entry, opcode, squeue, types};
 
 use std::{
+    alloc::{Layout, alloc_zeroed, dealloc},
+    cell::UnsafeCell,
     fs::File,
     io,
     os::fd::AsRawFd,
     sync::Arc,
-    cell::UnsafeCell,
 };
-
 
 #[allow(unused_imports)]
 use crate::ONE_MEGABYTE_BLOCK;
+
+/// Page size for O_DIRECT alignment
+const FOUR_KB_PAGE: usize = 4096;
 
 /// Type alias for the submit queue entry storage used by flush operations.
 pub type SubmitQueueEntry = UnsafeCell<Option<squeue::Entry>>;
@@ -74,7 +77,7 @@ pub type SubmitQueueEntry = UnsafeCell<Option<squeue::Entry>>;
 /// a place to store the SQE for potential re-submission.
 pub trait FlushableBuffer {
     /// Get the data to write.
-    fn buffer_data(&self) -> &[u8];
+    fn buffer_data(&self, data_len: usize) -> &[u8];
     /// Get the byte offset in the file.
     fn offset(&self) -> u64;
     /// Get the user data for the SQE.
@@ -132,7 +135,7 @@ pub enum WriteMode {
 ///
 /// In normal operation callers should not use `BackingStore` directly; instead,
 /// interact with the store through [`QuickIO`].
-pub struct BackingStore {
+pub(crate) struct BackingStore {
     /// Shared `O_DIRECT` file handle — the LSS backing file.
     store: Arc<File>,
     /// Shared `io_uring` instance.  Protected by a [`parking_lot::Mutex`] so
@@ -151,8 +154,6 @@ impl BackingStore {
     /// * `file_handle` — `O_DIRECT` file handle to the LSS backing file.
     /// * `mode`        — Write ordering mode.
     pub fn new(io_uring: SharedAsyncFileWriter, file_handle: Arc<File>, mode: WriteMode) -> Self {
-
-        
         Self {
             flusher: io_uring,
             store: file_handle,
@@ -241,7 +242,9 @@ impl BackingStore {
     /// The guard is held for the duration of the caller's critical section; keep
     /// it as short-lived as possible to avoid starving the write path.
 
-    pub fn cqueue(&self) -> parking_lot::lock_api::MutexGuard<'_, parking_lot::RawMutex, IoUring> {
+    pub(crate) fn io_instance__(
+        &self,
+    ) -> parking_lot::lock_api::MutexGuard<'_, parking_lot::RawMutex, IoUring> {
         let flusher_ring = self.flusher.lock();
         flusher_ring
     }
@@ -275,8 +278,10 @@ impl BackingStore {
 /// ```
 pub enum QuickIO {
     /// Strictly serialised write appender (`IO_LINK` per SQE).
+    #[allow(private_interfaces)]
     Searalized(BackingStore),
     /// Tail-localised write appender (no ordering flags).
+    #[allow(private_interfaces)]
     TailLocalized(BackingStore),
 }
 
@@ -285,13 +290,18 @@ impl QuickIO {
     ///
     /// Writes submitted through this variant will use [`WriteMode::SerializedWrites`].
     pub fn link(io_uring: SharedAsyncFileWriter, file: Arc<File>) -> Self {
-        QuickIO::Searalized(BackingStore::new(io_uring, file, WriteMode::SerializedWrites))
+        QuickIO::Searalized(BackingStore::new(
+            io_uring,
+            file,
+            WriteMode::SerializedWrites,
+        ))
     }
 
     /// Construct a [`QuickIO::TailLocalized`] from an existing ring and file handle.
     ///
     /// Writes submitted through this variant will use [`WriteMode::TailLocalizedWrites`].
-    pub fn new(io_uring: SharedAsyncFileWriter, file: Arc<File>) -> Self {
+    pub fn new(file: Arc<File>) -> Self {
+        let io_uring = Arc::new(parking_lot::Mutex::new(io_uring::IoUring::new(8).unwrap()));
         QuickIO::TailLocalized(BackingStore::new(
             io_uring,
             file,
@@ -309,9 +319,16 @@ impl QuickIO {
     /// # Safety
     ///
     /// The buffer data must remain valid until the CQE is observed.
-    pub fn submit_buffer<B: FlushableBuffer>(&self, buffer: &B) {
-        let buffer_data = buffer.buffer_data();
+    pub fn submit_buffer<B: FlushableBuffer>(&self, buffer: &B, data_len: usize) {
+        let buffer_data = buffer.buffer_data(data_len);
+
+
+        // println!("Buffer data {:?}", buffer_data );
+
         let at = buffer.offset();
+
+        println!("At {}", at);
+        
         let user_data = buffer.user_data(); // In this case, the user data is always a buffer's pinned location in memmory
         let submit_entry = buffer.submit_entry();
         self.submit_buffer_raw(buffer_data, at, user_data, submit_entry);
@@ -327,7 +344,13 @@ impl QuickIO {
     /// # Safety
     ///
     /// `buffer_data` must remain valid until the CQE is observed.
-    pub fn submit_buffer_raw(&self, buffer_data: &[u8], at: u64, user_data: u64, submit_entry: &SubmitQueueEntry) {
+    pub fn submit_buffer_raw(
+        &self,
+        buffer_data: &[u8],
+        at: u64,
+        user_data: u64,
+        submit_entry: &SubmitQueueEntry,
+    ) {
         match self {
             QuickIO::Searalized(a) | QuickIO::TailLocalized(a) => {
                 let _ = a.submit(buffer_data, at, user_data, submit_entry);
@@ -371,16 +394,122 @@ impl QuickIO {
         Ok(())
     }
 
-    /// Acquire exclusive access to the `io_uring` instance's completion queue.
+    /// Acquire exclusive access to a snapshot `io_uring` instance's completion queue.
     ///
-    pub fn get_cqueue(
-        &self,
-    ) -> parking_lot::lock_api::MutexGuard<'_, parking_lot::RawMutex, IoUring> {
+    pub fn cqe(&self) -> Vec<io_uring::cqueue::Entry> {
         match self {
             QuickIO::Searalized(appender) | QuickIO::TailLocalized(appender) => {
-                appender.cqueue()
+                let entries: Vec<Entry>;
+                {
+                    let mut io = appender.io_instance__();
+                    let mut cqe = io.completion();
+                    cqe.sync();
+                    entries = cqe.collect();
+                }
+
+                return entries;
             }
         }
+    }
+
+    /// Acquire exclusive access to a  `io_uring` instance.
+    ///
+    pub fn ring(&self) -> parking_lot::lock_api::MutexGuard<'_, parking_lot::RawMutex, IoUring> {
+        match self {
+            QuickIO::Searalized(appender) | QuickIO::TailLocalized(appender) => {
+                appender.io_instance__()
+            }
+        }
+    }
+
+    /// Retry submitting a previously failed S+QE.
+    ///
+    /// This method takes a stored SQE and re-submits it to the ring.
+    /// Useful for handling transient submission failures.
+    ///
+    /// # Safety
+    ///
+    /// The SQE must still be valid and the associated buffer data must remain valid.
+    pub fn retry_sqe(&self, sqe: &squeue::Entry) -> io::Result<()> {
+        let backing_store = self.get_backing_store();
+        let mut ring = backing_store.flusher.lock();
+
+        unsafe {
+            ring.submission()
+                .push(sqe)
+                .map_err(|_| io::Error::other("SQ full"))?;
+        }
+
+        ring.submit()?;
+        Ok(())
+    }
+
+    /// Read data from the backing store at the specified offset.
+    ///
+    /// This method performs an O_DIRECT read with proper alignment requirements.
+    /// The data is read into the provided buffer pointer.
+    ///
+    /// # Arguments
+    ///
+    /// * `ptr` - Pointer to the buffer where data should be read into
+    /// * `len` - Number of bytes to read
+    /// * `offset` - File offset to read from
+    ///
+    /// # Safety
+    ///
+    /// The pointer must be valid for `len` bytes and properly aligned for O_DIRECT.
+    pub fn read(&self, ptr: *mut u8, len: usize, offset: u64) -> io::Result<()> {
+        use io_uring::{opcode, types};
+        use std::os::fd::AsRawFd;
+
+        // O_DIRECT requires file offset aligned to 4KB
+        let aligned_offset = offset & !(FOUR_KB_PAGE as u64 - 1);
+        let delta = (offset - aligned_offset) as usize;
+        let aligned_len = (len + delta).next_multiple_of(FOUR_KB_PAGE);
+
+        let layout = Layout::from_size_align(aligned_len, FOUR_KB_PAGE).unwrap();
+        let aligned_ptr = unsafe { alloc_zeroed(layout) };
+        assert!(!aligned_ptr.is_null());
+
+        let backing_store = self.get_backing_store();
+
+        let sqe = opcode::Read::new(
+            types::Fd(backing_store.store.as_raw_fd()),
+            aligned_ptr,
+            aligned_len as u32,
+        )
+        .offset(aligned_offset)
+        .build();
+
+        let mut ring = self.ring();
+
+        unsafe {
+            ring.submission()
+                .push(&sqe)
+                .map_err(|_| io::Error::other("submission queue full"))?;
+        }
+
+        ring.submit_and_wait(1)?;
+
+        let cqe = ring
+            .completion()
+            .next()
+            .ok_or_else(|| io::Error::other("no completion"))?;
+
+        drop(ring);
+
+        if cqe.result() < 0 {
+            unsafe { dealloc(aligned_ptr, layout) };
+            return Err(io::Error::from_raw_os_error(-cqe.result()));
+        }
+
+        // Copy the requested bytes from the aligned buffer to the user buffer
+        unsafe {
+            std::ptr::copy_nonoverlapping(aligned_ptr.add(delta), ptr, len);
+            dealloc(aligned_ptr, layout);
+        }
+
+        Ok(())
     }
 
     fn get_backing_store(&self) -> &BackingStore {
