@@ -3,6 +3,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicPtr, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, Sender},
     },
 };
 
@@ -64,6 +65,8 @@ pub struct BufferRing {
     auto_rotate: bool,
 
     size: usize,
+
+    cq_tx: Option<Sender<(u64, usize)>>,
 }
 
 pub struct BufferRingOptions {
@@ -72,6 +75,7 @@ pub struct BufferRingOptions {
     io_instance: Option<Arc<QuikIO>>,
     auto_flush: bool,
     auto_rotate: bool,
+    cq_tx: Option<Sender<(u64, usize)>>,
 }
 
 /// Configuration options for a `BufferRing` instance.
@@ -100,8 +104,10 @@ impl BufferRingOptions {
             io_instance: None,
             auto_flush: true,
             auto_rotate: true,
+            cq_tx: None,
         }
     }
+    
 
     /// Sets the capacity for this buffer ring.
     ///
@@ -114,7 +120,7 @@ impl BufferRingOptions {
     ///
     pub fn buffer_size(&mut self, buffer_size: usize) -> &mut Self {
         let size = buffer_size.next_multiple_of(buffer_size);
-        self.capacity = size;
+        self.buffer_size = size;
         self
     }
 
@@ -151,6 +157,17 @@ impl BufferRingOptions {
         self.auto_rotate = enabled;
         self
     }
+
+    /// Attach a completion channel.
+    ///
+    /// Returns a `Receiver` that yields `(file_offset, byte_count)` each time
+    /// a buffer is confirmed written by a CQE. The sender end is stored in the
+    /// ring; call `check_cque` to drive it.
+    pub fn completion_receiver(&mut self) -> Receiver<(u64, usize)> {
+        let (tx, rx) = mpsc::channel();
+        self.cq_tx = Some(tx);
+        rx
+    }
 }
 
 impl BufferRing {
@@ -161,7 +178,7 @@ impl BufferRing {
     /// without requiring a real `io_uring` instance or backing file.  In this
     /// mode, sealed buffers are reset immediately after flush is triggered,
     /// keeping the ring from stalling.
-    pub fn with_options(options: BufferRingOptions) -> BufferRing {
+    pub fn with_options(options: &mut BufferRingOptions) -> BufferRing {
         let buffers: Vec<Arc<FlushBuffer>> = (0..options.capacity)
             .map(|i| Arc::new(FlushBuffer::new_buffer(i, options.buffer_size)))
             .collect();
@@ -169,15 +186,18 @@ impl BufferRing {
         let buffers = Pin::new(buffers.into_boxed_slice());
         let current = &*buffers[0] as *const FlushBuffer as *mut FlushBuffer;
 
+        let instance = options.io_instance.take();
+
         BufferRing {
             current_buffer: AtomicPtr::new(current),
             ring: buffers,
             next_index: AtomicUsize::new(1),
             size: options.capacity,
             next_address_range: AtomicUsize::new(0),
-            store: options.io_instance,
+            store: instance,
             auto_flush: options.auto_flush,
             auto_rotate: options.auto_rotate,
+            cq_tx: options.cq_tx.take(),
         }
     }
 
@@ -330,6 +350,8 @@ impl BufferRing {
         match self.store.as_ref() {
             Some(store) => {
                 store.submit_buffer(buffer);
+
+                let _ = store.wait_for_all();
                 store.sync_data().expect("Drained Submission Queue");
                 self.reset_buffer(buffer);
             }
@@ -432,20 +454,23 @@ impl BufferRing {
         if let Some(store) = &self.store {
             let cqes = store.cqe();
 
+
             if cqes.is_empty() {
                 return Ok(());
             }
-            eprintln!(
-                "[check_cque] cqe results: {:?}",
-                cqes.iter().map(|c| c.result()).collect::<Vec<_>>()
-            );
 
             for cqe in cqes {
+            
+                // sync_data's fdatasync SQE uses user_data(0) as a sentinel —
+                // skip it, there is no buffer to recover or reset
+                if cqe.user_data() == 0 {
+                    continue;
+                }
+
                 let ptr = cqe.user_data() as *const FlushBuffer;
                 let buffer: &FlushBuffer = unsafe { &*ptr };
 
                 if cqe.result() < 0 {
-                    // Retry failed write
                     let sqe = unsafe {
                         (*buffer.sqe.get())
                             .as_ref()
@@ -453,11 +478,17 @@ impl BufferRing {
                     };
                     let mut ring = store.ring();
                     unsafe {
-                        let _ = ring.submission().push(&sqe);
+                        let _ = ring.submission().push(sqe);
                     }
                     let _ = ring.submit();
                 } else {
-                    // Write completed successfully — release the buffer back to the ring
+                    if let Some(tx) = &self.cq_tx {
+                        let file_offset = buffer.local_address(Ordering::Acquire) as u64;
+                        let byte_count = buffer.size();
+
+                  
+                        let _ = tx.send((file_offset, byte_count));
+                    }
                     self.reset_buffer(buffer);
                 }
             }
@@ -465,10 +496,8 @@ impl BufferRing {
             return Ok(());
         }
 
-        return Err("Store Not present".to_string());
+        Err("Store not present".to_string())
     }
-
-
     /// Atomically loads the address range
     pub fn next_address(&self, ordering: Ordering) -> usize {
         self.next_address_range.load(ordering)
@@ -490,7 +519,6 @@ impl BufferRing {
         let ptr = self.current_buffer.load(ordering);
         unsafe { ptr.as_ref().unwrap() }
     }
-
 
     /// Gets the ring size
     pub fn ring_size(&self) -> usize {
@@ -637,12 +665,13 @@ mod tests {
         );
 
         let quickio = QuikIO::new(file);
-        let ring = Arc::new(BufferRing::with_options(BufferRingOptions {
+        let ring = Arc::new(BufferRing::with_options(&mut BufferRingOptions {
             capacity: TEST_RING_SIZE,
             buffer_size: ONE_MEGABYTE_BLOCK,
             io_instance: Some(quickio.into()),
             auto_flush: true,
             auto_rotate: true,
+            cq_tx: None,
         }));
 
         let watchdog_ring = Arc::clone(&ring);
@@ -775,12 +804,13 @@ mod tests {
         multi_threaded_stress_helper(NUM_THREADS_LARGE);
     }
     fn multi_threaded_stress_helper(num_threads: usize) {
-        let ring = Arc::new(BufferRing::with_options(BufferRingOptions {
+        let ring = Arc::new(BufferRing::with_options(&mut BufferRingOptions {
             capacity: TEST_RING_SIZE,
             buffer_size: ONE_MEGABYTE_BLOCK,
             io_instance: None,
             auto_flush: false,
             auto_rotate: true,
+            cq_tx: None,
         }));
 
         let watchdog_ring = Arc::clone(&ring);

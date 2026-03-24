@@ -287,7 +287,8 @@ impl QuikIO {
     /// Construct a [`QuikIO::Searalized`] from an existing ring and file handle.
     ///
     /// Writes submitted through this variant will use [`WriteMode::SerializedWrites`].
-    pub fn link(io_uring: SharedAsyncFileWriter, file: Arc<File>) -> Self {
+    pub fn link(file: Arc<File>) -> Self {
+                let io_uring = Arc::new(parking_lot::Mutex::new(io_uring::IoUring::new(8).unwrap()));
         QuikIO::Searalized(BackingStore::new(
             io_uring,
             file,
