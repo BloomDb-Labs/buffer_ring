@@ -1,0 +1,23 @@
+[package]
+name = "buffer_ring"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+description = "A high-performance, latch-free log-structured storage layer built for modern flash storage and multi-core systems."
+repository = "https://github.com/BloomDb-Labs/buffer_ring"
+homepage = "https://github.com/BloomDb-Labs/buffer_ring"
+documentation = "https://docs.rs/buffer_ring"
+
+
+[dependencies]
+libc = "0.2"
+parking_lot = "0.12.5"
+loom = { version = "0.7", features = ["checkpoint"], optional = true }
+
+
+io-uring = "0.7.11"
+bytes = "1.11.1"
+
+
+[dev-dependencies]
+tempfile = "3.0"
