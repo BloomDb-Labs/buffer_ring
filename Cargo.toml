@@ -1,6 +1,6 @@
 [package]
 name = "buffer_ring"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "GPL-3.0"
 description = "A high-performance, latch-free log-structured storage layer built for modern flash storage and multi-core systems."

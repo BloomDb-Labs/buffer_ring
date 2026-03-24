@@ -107,7 +107,6 @@ impl BufferRingOptions {
             cq_tx: None,
         }
     }
-    
 
     /// Sets the capacity for this buffer ring.
     ///
@@ -454,13 +453,11 @@ impl BufferRing {
         if let Some(store) = &self.store {
             let cqes = store.cqe();
 
-
             if cqes.is_empty() {
                 return Ok(());
             }
 
             for cqe in cqes {
-            
                 // sync_data's fdatasync SQE uses user_data(0) as a sentinel —
                 // skip it, there is no buffer to recover or reset
                 if cqe.user_data() == 0 {
@@ -486,7 +483,6 @@ impl BufferRing {
                         let file_offset = buffer.local_address(Ordering::Acquire) as u64;
                         let byte_count = buffer.size();
 
-                  
                         let _ = tx.send((file_offset, byte_count));
                     }
                     self.reset_buffer(buffer);

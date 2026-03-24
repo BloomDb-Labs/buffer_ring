@@ -64,8 +64,7 @@ pub mod ring;
 pub mod state;
 
 pub use crate::quik_io::{FlushableBuffer, QuikIO, WriteMode};
-pub use crate::ring::{BufferRingOptions, BufferRing};
-
+pub use crate::ring::{BufferRing, BufferRingOptions};
 
 pub use crate::state::State;
 
@@ -151,7 +150,7 @@ const SEALED_BIT: usize = 1 << 0;
 ///
 /// Prevents a second flush from being fired concurrently and prevents new
 /// writers from entering a buffer that is already being drained.
-pub(crate) const FLUSH_IN_PROGRESS_BIT: usize = 1 << 1;
+pub const FLUSH_IN_PROGRESS_BIT: usize = 1 << 1;
 
 /// Amount added to the state word to record one additional active writer.
 const WRITER_SHIFT: usize = 8;
@@ -177,25 +176,25 @@ pub const FOUR_KB_BLOCK: usize = 4096;
 
 #[inline(always)]
 /// Extracts the current offset out of the state variable
-pub(crate) fn state_offset(state: usize) -> usize {
+pub fn state_offset(state: usize) -> usize {
     state >> OFFSET_SHIFT
 }
 
 #[inline(always)]
 /// Extracts the current current number of writers out of the state variable
-pub(crate) fn state_writers(state: usize) -> usize {
+pub fn state_writers(state: usize) -> usize {
     (state & WRITER_MASK) >> WRITER_SHIFT
 }
 
 #[inline(always)]
 /// Returns the sealed bit of the state variable
-pub(crate) fn state_sealed(state: usize) -> bool {
+pub fn state_sealed(state: usize) -> bool {
     state & SEALED_BIT != 0
 }
 
 #[inline(always)]
 /// Returns the flush in progress bit of the state variable
-fn state_flush_in_progress(state: usize) -> bool {
+pub fn state_flush_in_progress(state: usize) -> bool {
     state & FLUSH_IN_PROGRESS_BIT != 0
 }
 

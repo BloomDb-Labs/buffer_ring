@@ -288,7 +288,7 @@ impl QuikIO {
     ///
     /// Writes submitted through this variant will use [`WriteMode::SerializedWrites`].
     pub fn link(file: Arc<File>) -> Self {
-                let io_uring = Arc::new(parking_lot::Mutex::new(io_uring::IoUring::new(8).unwrap()));
+        let io_uring = Arc::new(parking_lot::Mutex::new(io_uring::IoUring::new(8).unwrap()));
         QuikIO::Searalized(BackingStore::new(
             io_uring,
             file,
@@ -320,8 +320,6 @@ impl QuikIO {
     /// The buffer data must remain valid until the CQE is observed.
     pub fn submit_buffer<B: FlushableBuffer>(&self, buffer: &B) {
         let buffer_data = buffer.buffer_data();
-
-        // println!("Buffer data {:?}", buffer_data );
 
         let at = buffer.offset();
 
@@ -359,6 +357,8 @@ impl QuikIO {
     /// `IO_DRAIN` causes the kernel to complete every previously submitted SQE
     /// before executing this one, so all in-flight `submit_buffer` writes are
     /// guaranteed durable before this returns.
+    ///
+    /// Note: does not wait untill the complete queue has been deplenished
     pub fn sync_data(&self) -> io::Result<()> {
         let backing_store = self.get_backing_store();
         let mut ring = backing_store.flusher.lock();
@@ -632,8 +632,9 @@ pub mod test {
             quickio.submit_buffer(buf);
         }
 
-        quickio.wait_for_all().unwrap();
         quickio.sync_data().unwrap();
+        
+        quickio.wait_for_all().unwrap();
 
         // Verify
         for (i, check_against) in expected.iter().enumerate() {
