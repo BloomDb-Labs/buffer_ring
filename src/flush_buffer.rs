@@ -52,7 +52,8 @@ impl FlushBuffer {
     /// A buffer is available when neither the sealed bit nor the
     /// flush-in-progress bit is set.
     pub fn is_available(&self) -> bool {
-        self.state.load(Ordering::Acquire) & (SEALED_BIT | FLUSH_IN_PROGRESS_BIT) == 0
+        let state = self.state.load(Ordering::Acquire);
+        (state & (SEALED_BIT | FLUSH_IN_PROGRESS_BIT)) == 0 && state_offset(state) == 0
     }
 
     /// Attempt to atomically reserve `payload_size` bytes in this buffer.

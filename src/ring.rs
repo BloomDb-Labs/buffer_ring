@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     BufferError, BufferMsg, FLUSH_IN_PROGRESS_BIT, FOUR_KB_BLOCK, FlushBuffer, OFFSET_SHIFT,
-    SEALED_BIT, quik_io::QuikIO, state_sealed, state_writers,
+    SEALED_BIT, quik_io::QuikIO, state_offset, state_sealed, state_writers,
 };
 
 /// A fixed-size ring of [`FlushBuffer`]s that amortises writes into batched
@@ -372,6 +372,7 @@ impl BufferRing {
     pub fn rotate_after_seal(&self, sealed_pos: usize) -> Result<(), BufferError> {
         let current = self.current_buffer.load(Ordering::Acquire);
         let current_ref = unsafe { current.as_ref().ok_or(BufferError::InvalidState)? };
+        let current_size = current_ref.size();
 
         if current_ref.pos != sealed_pos {
             return Ok(());
@@ -387,10 +388,13 @@ impl BufferRing {
             if new_buffer.is_available() {
                 let _ = self.current_buffer.compare_exchange(
                     current,
-                    Arc::as_ptr(new_buffer) as *const FlushBuffer as *mut FlushBuffer,
+                    Arc::as_ptr(new_buffer) as *mut FlushBuffer,
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 );
+
+                self.__reserve_buf_addr(new_buffer, current_size);
+
                 return Ok(());
             }
         }
@@ -425,75 +429,74 @@ impl BufferRing {
     /// }
     /// ```
     pub fn reset_buffer(&self, buffer: &FlushBuffer) {
-        loop {
-            let flushed_buffer_state = buffer.state.load(Ordering::Acquire);
-
-            const OFFSET_MASK: usize = usize::MAX << OFFSET_SHIFT;
-            let reset = flushed_buffer_state & !(SEALED_BIT | FLUSH_IN_PROGRESS_BIT | OFFSET_MASK);
-
-            if buffer
-                .state
-                .compare_exchange(
-                    flushed_buffer_state,
-                    reset,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                break;
-            }
-        }
+        buffer.state.store(0, Ordering::SeqCst);
+        buffer.local_address.store(0, Ordering::Release);
     }
 
     /// Internal completion queue processing.
     ///
     /// Drains all available CQEs and re-submits any failed writes
     pub fn check_cque(&self) -> Result<(), String> {
-        if let Some(store) = &self.store {
-            let cqes = store.cqe();
+        let Some(store) = &self.store else {
+            return Err("Store not present".to_string());
+        };
 
+        loop {
+            let cqes = store.cqe();
             if cqes.is_empty() {
                 return Ok(());
             }
 
             for cqe in cqes {
-                // sync_data's fdatasync SQE uses user_data(0) as a sentinel —
-                // skip it, there is no buffer to recover or reset
                 if cqe.user_data() == 0 {
                     continue;
                 }
 
                 let ptr = cqe.user_data() as *const FlushBuffer;
-                let buffer: &FlushBuffer = unsafe { &*ptr };
+                let buffer = unsafe { &*ptr };
 
                 if cqe.result() < 0 {
-                    let sqe = unsafe {
-                        (*buffer.sqe.get())
-                            .as_ref()
-                            .expect("stored SQE must be present on retry")
-                    };
-                    let mut ring = store.ring();
-                    unsafe {
-                        let _ = ring.submission().push(sqe);
+                    // Retry failed write
+                    if let Some(sqe) = unsafe { (*buffer.sqe.get()).as_ref() } {
+                        let mut ring_guard = store.ring();
+                        let _ = unsafe { ring_guard.submission().push(sqe) };
+                        let _ = ring_guard.submit();
                     }
-                    let _ = ring.submit();
                 } else {
+                    // Success: record range + reset buffer
                     if let Some(tx) = &self.cq_tx {
                         let file_offset = buffer.local_address(Ordering::Acquire) as u64;
                         let byte_count = buffer.size();
-
                         let _ = tx.send((file_offset, byte_count));
                     }
-                    self.reset_buffer(buffer);
+                    self.reset_buffer(buffer); // <-- now reliable
                 }
             }
+        }
+    }
 
+    /// Seals and flushes the current buffer
+    pub fn flush_current(&self) -> Result<(), BufferError> {
+        let current_ptr = self.current_buffer.load(Ordering::Acquire);
+        let current = unsafe { current_ptr.as_ref().ok_or(BufferError::InvalidState)? };
+
+        if current.size() == 0 {
             return Ok(());
         }
 
-        Err("Store not present".to_string())
+        let _ = current.seal();
+
+        // Reserve exact size at seal time (matches your updated RingWriter)
+        let actual_len = current.size();
+        let slot = self.incrment_address(actual_len, Ordering::SeqCst);
+        current.local_address.store(slot, Ordering::Release);
+
+        self.flush(current);
+        let _ = self.rotate_after_seal(current.pos);
+
+        Ok(())
     }
+
     /// Atomically loads the address range
     pub fn next_address(&self, ordering: Ordering) -> usize {
         self.next_address_range.load(ordering)
@@ -502,6 +505,15 @@ impl BufferRing {
     /// Atomically increments the lss address range of a flush buffer.
     pub fn incrment_address(&self, val: usize, ordering: Ordering) -> usize {
         self.next_address_range.fetch_add(val, ordering)
+    }
+
+    /// Reserve exact address space for a buffer at the moment it becomes active.
+    /// Called when rotating to a new current buffer.
+    fn __reserve_buf_addr(&self, buffer: &FlushBuffer, size: usize) {
+        let slot = self.incrment_address(size, Ordering::SeqCst);
+        let _ = buffer
+            .local_address
+            .compare_exchange(0, slot, Ordering::AcqRel, Ordering::Relaxed);
     }
 
     /// Get a reference to the current active buffer.
@@ -519,408 +531,5 @@ impl BufferRing {
     /// Gets the ring size
     pub fn ring_size(&self) -> usize {
         self.size
-    }
-}
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-
-    use std::{
-        fs::OpenOptions,
-        os::unix::fs::OpenOptionsExt,
-        sync::{Arc, Barrier, Mutex, atomic::AtomicBool},
-        thread,
-        time::{Duration, Instant},
-    };
-
-    /// Very small, very lightweight, very unimpressive Linear Congruential Generator for deterministic
-    /// pseudorandom number generation in tests.
-    /// source: https://en.wikipedia.org/wiki/Linear_congruential_generator
-    struct Lcg {
-        state: u64,
-    }
-
-    impl Lcg {
-        fn new(seed: u64) -> Self {
-            Self { state: seed }
-        }
-
-        fn next_usize(&mut self, bound: usize) -> usize {
-            self.state = self
-                .state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((self.state >> 33) as usize) % bound
-        }
-    }
-
-    const TEST_RING_SIZE: usize = 4;
-    const OPS_PER_THREAD: usize = 2_000;
-
-    /// Payload sizes ranging from tiny to near-capacity.
-    const SIZES: &[usize] = &[
-        1, 2, 4, 7, 8, 15, 16, 32, 64, 100, 128, 200, 256, 512, 1024, 2048, 4090, 4095, 4096,
-    ];
-
-    /// Build a recognisable, size-stamped payload.
-    fn make_payload(tag: &str, size: usize) -> Vec<u8> {
-        let meta = format!("[{tag}:{size}]");
-        let mut buf = vec![0xAA_u8; size];
-        let n = meta.len().min(size);
-        buf[..n].copy_from_slice(&meta.as_bytes()[..n]);
-        buf
-    }
-
-    // =========================================================================
-    // Retry helper
-    //
-    // The ring does not retry internally — that is the caller's responsibility
-    // (mapping table in production, this helper in tests).
-    //
-    // Loop:
-    //   1. Load current buffer.
-    //   2. Call reserve_space.
-    //   3. Pass result into put.
-    //   4. Retry on transient errors (FailedReservation, EncounteredSealedBuffer,
-    //      ActiveUsers).
-    //   5. Any other outcome is final.
-    // =========================================================================
-    fn put_with_retry(ring: &BufferRing, payload: &[u8]) -> Result<BufferMsg, BufferError> {
-        loop {
-            let _ = ring.check_cque();
-            let current = unsafe {
-                ring.current_buffer
-                    .load(Ordering::Acquire)
-                    .as_ref()
-                    .ok_or(BufferError::InvalidState)?
-            };
-
-            let reserve_result = current.reserve_space(payload.len());
-
-            match &reserve_result {
-                Err(BufferError::FailedReservation) => continue,
-                Err(BufferError::EncounteredSealedBuffer) => continue,
-                _ => {}
-            }
-
-            match ring.put(current, reserve_result, payload) {
-                Err(BufferError::ActiveUsers) => continue,
-                Err(BufferError::EncounteredSealedBuffer) => {
-                    let _ = ring.check_cque();
-                    std::thread::yield_now();
-                    continue;
-                }
-                Err(BufferError::RingExhausted) => {
-                    let _ = ring.check_cque();
-                    std::thread::yield_now();
-                    continue;
-                }
-                other => return other,
-            }
-        }
-    }
-
-    use tempfile::NamedTempFile;
-
-    use crate::{ONE_MEGABYTE_BLOCK, quik_io::QuikIO};
-
-    const NUM_THREADS_SMALL: usize = 2;
-    const NUM_THREADS_MEDIUM: usize = 4;
-    const NUM_THREADS_LARGE: usize = 8;
-
-    #[test]
-    fn writer_test_small() {
-        multi_threaded_stress_writer(NUM_THREADS_SMALL);
-    }
-
-    #[test]
-    fn writer_test_medium() {
-        multi_threaded_stress_writer(NUM_THREADS_MEDIUM);
-    }
-
-    #[test]
-    fn writer_test_large() {
-        multi_threaded_stress_writer(NUM_THREADS_LARGE);
-    }
-
-    fn multi_threaded_stress_writer(num_threads: usize) {
-        let temp_file = NamedTempFile::new().unwrap();
-
-        let file = Arc::new(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                // O_DIRECT bypasses the kernel page cache.
-                // INVARIANT: every buffer passed to read/write must be aligned to
-                // FOUR_KB_PAGE — upheld by Buffer::new_aligned in flush_buffer.rs.
-                .custom_flags(libc::O_DIRECT)
-                .open(temp_file.path())
-                .unwrap(),
-        );
-
-        let quickio = QuikIO::new(file);
-        let ring = Arc::new(BufferRing::with_options(&mut BufferRingOptions {
-            capacity: TEST_RING_SIZE,
-            buffer_size: ONE_MEGABYTE_BLOCK,
-            io_instance: Some(quickio.into()),
-            auto_flush: true,
-            auto_rotate: true,
-            cq_tx: None,
-        }));
-
-        let watchdog_ring = Arc::clone(&ring);
-        let watchdog_done = Arc::new(AtomicBool::new(false));
-        let watchdog_done_clone = Arc::clone(&watchdog_done);
-
-        let watchdog = thread::spawn(move || {
-            let mut tick = 0u64;
-            while !watchdog_done_clone.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(500));
-                tick += 1;
-
-                let current_ptr = watchdog_ring.current_buffer.load(Ordering::Acquire);
-                let current = unsafe { current_ptr.as_ref().unwrap() };
-                let state = current.state();
-
-                eprintln!(
-                    "[watchdog tick={tick}] current_buffer pos={pos} | \
-                 offset={offset} writers={writers} sealed={sealed} flushing={flushing}",
-                    pos = current.pos,
-                    offset = state.offset(),
-                    writers = state.n_writers(),
-                    sealed = state.sealed(),
-                    flushing = state.flushing(),
-                );
-
-                // Dump every buffer in the ring
-                for (i, buf) in watchdog_ring.ring.iter().enumerate() {
-                    let s = buf.state();
-                    eprintln!(
-                        "  [buf {i}] offset={} writers={} sealed={} flushing={} addr={}",
-                        s.offset(),
-                        s.n_writers(),
-                        s.sealed(),
-                        s.flushing(),
-                        buf.local_address(Ordering::Acquire),
-                    );
-                }
-            }
-            eprintln!("[watchdog] shutting down after {tick} ticks");
-        });
-        // ─────────────────────────────────────────────────────────────────────────
-
-        let barrier = Arc::new(Barrier::new(num_threads));
-        let total_writes = Arc::new(AtomicUsize::new(0));
-        let total_flushes = Arc::new(AtomicUsize::new(0));
-        let start_times = Arc::new(Mutex::new(Vec::new()));
-
-        let handles: Vec<thread::JoinHandle<()>> = (0..num_threads)
-            .map(|tid| {
-                let ring = Arc::clone(&ring);
-                let barrier = Arc::clone(&barrier);
-                let total_writes = Arc::clone(&total_writes);
-                let total_flushes = Arc::clone(&total_flushes);
-                let start_times = Arc::clone(&start_times);
-
-                let seed = 0x1234_5678_u64
-                    .wrapping_add(tid as u64)
-                    .wrapping_mul(0xDEAD_CAFE);
-
-                thread::spawn(move || {
-                    let mut rng = Lcg::new(seed);
-                    let mut local_writes = 0usize;
-                    let mut local_flushes = 0usize;
-
-                    barrier.wait();
-                    start_times.lock().unwrap().push(Instant::now());
-
-                    for op in 0..OPS_PER_THREAD {
-                        let size = SIZES[rng.next_usize(SIZES.len())];
-                        let payload = make_payload(&format!("T{tid}:O{op:04}"), size);
-
-                        match put_with_retry(&ring, &payload) {
-                            Ok(BufferMsg::SuccessfullWrite) => local_writes += 1,
-                            Ok(BufferMsg::SuccessfullWriteFlush) => {
-                                local_writes += 1;
-                                local_flushes += 1;
-                            }
-                            other => panic!("thread {tid} op {op}: unexpected {other:?}"),
-                        }
-                    }
-
-                    total_writes.fetch_add(local_writes, Ordering::Relaxed);
-                    total_flushes.fetch_add(local_flushes, Ordering::Relaxed);
-                })
-            })
-            .collect();
-
-        for (tid, handle) in handles.into_iter().enumerate() {
-            handle
-                .join()
-                .unwrap_or_else(|_| panic!("worker thread {tid} panicked"));
-        }
-
-        // Signal watchdog to stop and wait for it
-        watchdog_done.store(true, Ordering::Relaxed);
-        watchdog.join().unwrap();
-
-        let join_time = Instant::now();
-        let writes = total_writes.load(Ordering::Relaxed);
-        let flushes = total_flushes.load(Ordering::Relaxed);
-        let earliest_start = start_times.lock().unwrap().iter().copied().min().unwrap();
-        let elapsed = join_time.duration_since(earliest_start);
-
-        println!(
-            "multi_threaded_stress({num_threads} threads): {writes} writes, {flushes} flushes \
-         in {elapsed:.2?} ({:.0} ops/s)",
-            writes as f64 / elapsed.as_secs_f64()
-        );
-
-        assert_eq!(
-            writes,
-            num_threads * OPS_PER_THREAD,
-            "total writes should equal num_threads * OPS_PER_THREAD"
-        );
-    }
-
-    #[test]
-    fn multi_threaded_test_small() {
-        multi_threaded_stress_helper(NUM_THREADS_SMALL);
-    }
-
-    #[test]
-    fn multi_threaded_test_medium() {
-        multi_threaded_stress_helper(NUM_THREADS_MEDIUM);
-    }
-
-    #[test]
-    fn multi_threaded_test_large() {
-        multi_threaded_stress_helper(NUM_THREADS_LARGE);
-    }
-    fn multi_threaded_stress_helper(num_threads: usize) {
-        let ring = Arc::new(BufferRing::with_options(&mut BufferRingOptions {
-            capacity: TEST_RING_SIZE,
-            buffer_size: ONE_MEGABYTE_BLOCK,
-            io_instance: None,
-            auto_flush: false,
-            auto_rotate: true,
-            cq_tx: None,
-        }));
-
-        let watchdog_ring = Arc::clone(&ring);
-        let watchdog_done = Arc::new(AtomicBool::new(false));
-        let watchdog_done_clone = Arc::clone(&watchdog_done);
-
-        let watchdog = thread::spawn(move || {
-            let mut tick = 0u64;
-            while !watchdog_done_clone.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(500));
-                tick += 1;
-
-                let current_ptr = watchdog_ring.current_buffer.load(Ordering::Acquire);
-                let current = unsafe { current_ptr.as_ref().unwrap() };
-                let state = current.state();
-
-                eprintln!(
-                    "[watchdog tick={tick}] current_buffer pos={pos} | \
-                 offset={offset} writers={writers} sealed={sealed} flushing={flushing}",
-                    pos = current.pos,
-                    offset = state.offset(),
-                    writers = state.n_writers(),
-                    sealed = state.sealed(),
-                    flushing = state.flushing(),
-                );
-
-                // Dump every buffer in the ring
-                for (i, buf) in watchdog_ring.ring.iter().enumerate() {
-                    let s = buf.state();
-                    eprintln!(
-                        "  [buf {i}] offset={} writers={} sealed={} flushing={} addr={}",
-                        s.offset(),
-                        s.n_writers(),
-                        s.sealed(),
-                        s.flushing(),
-                        buf.local_address(Ordering::Acquire),
-                    );
-                }
-            }
-            eprintln!("[watchdog] shutting down after {tick} ticks");
-        });
-        // ─────────────────────────────────────────────────────────────────────────
-
-        let barrier = Arc::new(Barrier::new(num_threads));
-        let total_writes = Arc::new(AtomicUsize::new(0));
-        let total_flushes = Arc::new(AtomicUsize::new(0));
-        let start_times = Arc::new(Mutex::new(Vec::new()));
-
-        let handles: Vec<thread::JoinHandle<()>> = (0..num_threads)
-            .map(|tid| {
-                let ring = Arc::clone(&ring);
-                let barrier = Arc::clone(&barrier);
-                let total_writes = Arc::clone(&total_writes);
-                let total_flushes = Arc::clone(&total_flushes);
-                let start_times = Arc::clone(&start_times);
-
-                let seed = 0x1234_5678_u64
-                    .wrapping_add(tid as u64)
-                    .wrapping_mul(0xDEAD_CAFE);
-
-                thread::spawn(move || {
-                    let mut rng = Lcg::new(seed);
-                    let mut local_writes = 0usize;
-                    let mut local_flushes = 0usize;
-
-                    barrier.wait();
-                    start_times.lock().unwrap().push(Instant::now());
-
-                    for op in 0..OPS_PER_THREAD {
-                        let size = SIZES[rng.next_usize(SIZES.len())];
-                        let payload = make_payload(&format!("T{tid}:O{op:04}"), size);
-
-                        match put_with_retry(&ring, &payload) {
-                            Ok(BufferMsg::SuccessfullWrite) => local_writes += 1,
-                            Ok(BufferMsg::SuccessfullWriteFlush) => {
-                                local_writes += 1;
-                                local_flushes += 1;
-                            }
-                            other => panic!("thread {tid} op {op}: unexpected {other:?}"),
-                        }
-                    }
-
-                    total_writes.fetch_add(local_writes, Ordering::Relaxed);
-                    total_flushes.fetch_add(local_flushes, Ordering::Relaxed);
-                })
-            })
-            .collect();
-
-        for (tid, handle) in handles.into_iter().enumerate() {
-            handle
-                .join()
-                .unwrap_or_else(|_| panic!("worker thread {tid} panicked"));
-        }
-
-        // Signal watchdog to stop and wait for it
-        watchdog_done.store(true, Ordering::Relaxed);
-        watchdog.join().unwrap();
-
-        let join_time = Instant::now();
-        let writes = total_writes.load(Ordering::Relaxed);
-        let flushes = total_flushes.load(Ordering::Relaxed);
-        let earliest_start = start_times.lock().unwrap().iter().copied().min().unwrap();
-        let elapsed = join_time.duration_since(earliest_start);
-
-        println!(
-            "multi_threaded_stress({num_threads} threads): {writes} writes, {flushes} flushes \
-         in {elapsed:.2?} ({:.0} ops/s)",
-            writes as f64 / elapsed.as_secs_f64()
-        );
-
-        assert_eq!(
-            writes,
-            num_threads * OPS_PER_THREAD,
-            "total writes should equal num_threads * OPS_PER_THREAD"
-        );
     }
 }

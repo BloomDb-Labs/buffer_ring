@@ -324,6 +324,7 @@ impl QuikIO {
         let at = buffer.offset();
 
         let user_data = buffer.user_data(); // In this case, the user data is always a buffer's pinned location in memmory
+
         let submit_entry = buffer.submit_entry();
         self.submit_buffer_raw(buffer_data, at, user_data, submit_entry);
     }
@@ -403,19 +404,19 @@ impl QuikIO {
     /// Acquire exclusive access to a snapshot `io_uring` instance's completion queue.
     ///
     pub fn cqe(&self) -> Vec<io_uring::cqueue::Entry> {
-        match self {
-            QuikIO::Searalized(appender) | QuikIO::TailLocalized(appender) => {
-                let entries: Vec<Entry>;
-                {
-                    let mut io = appender.io_instance__();
-                    let mut cqe = io.completion();
-                    cqe.sync();
-                    entries = cqe.collect();
-                }
+        let mut entries = Vec::new();
+        let mut io = self.ring(); // acquires the lock
 
-                return entries;
+        {
+            let mut cq = io.completion();
+            cq.sync(); // crucial: sync with kernel
+
+            while let Some(cqe) = cq.next() {
+                entries.push(cqe);
             }
         }
+
+        entries
     }
 
     /// Acquire exclusive access to a  `io_uring` instance.
@@ -633,7 +634,7 @@ pub mod test {
         }
 
         quickio.sync_data().unwrap();
-        
+
         quickio.wait_for_all().unwrap();
 
         // Verify

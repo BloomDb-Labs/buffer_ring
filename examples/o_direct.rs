@@ -6,7 +6,7 @@ use std::{
 };
 
 use buffer_ring::{
-    BufferRing, BufferRingOptions, ONE_MEGABYTE_BLOCK, QuikIO, RING_SIZE, WriteMode, quik_io,
+    BufferRing, BufferRingOptions, ONE_MEGABYTE_BLOCK, QuikIO, RING_SIZE, WriteMode,
 };
 
 fn main() {
